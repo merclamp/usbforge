@@ -20,7 +20,11 @@ use usbforge_core::write::{self, WriteOptions};
 use usbforge_core::PRODUCT;
 
 #[derive(Parser)]
-#[command(name = "usbforge", version, about = "Cross-platform bootable USB / disk image writer")]
+#[command(
+    name = "usbforge",
+    version,
+    about = "Cross-platform bootable USB / disk image writer"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -105,14 +109,14 @@ fn cmd_list(all: bool) -> Result<()> {
 
 fn print_device_table(devices: &[Device]) {
     println!(
-        "{:<14} {:>8} {:>8} {:<3} {:<3} {}",
-        "PATH", "BUS", "SIZE", "RM", "RO", "NAME"
+        "{:<14} {:>8} {:>8} {:<3} {:<3} NAME",
+        "PATH", "BUS", "SIZE", "RM", "RO"
     );
     for d in devices {
         println!(
             "{:<14} {:>8} {:>8} {:<3} {:<3} {}",
             d.path,
-            d.bus.to_string(),
+            d.bus,
             d.size_human(),
             if d.removable { "yes" } else { "no" },
             if d.read_only { "yes" } else { "no" },
@@ -123,7 +127,7 @@ fn print_device_table(devices: &[Device]) {
 
 fn cmd_inspect(path: &str) -> Result<()> {
     let info: ImageInfo = ImageInfo::inspect(path).context("failed to inspect image")?;
-    println!("{} — {}", PRODUCT, "image inspection");
+    println!("{PRODUCT} — image inspection");
     println!("  path: {}", info.path.display());
     println!(
         "  size: {} ({} bytes)",
@@ -189,9 +193,7 @@ fn cmd_write(
         .iter()
         .find(|d| d.path == device_arg || d.id == device_arg)
         .ok_or_else(|| {
-            anyhow!(
-                "device '{device_arg}' not found; run `usbforge list --all` to see ids/paths"
-            )
+            anyhow!("device '{device_arg}' not found; run `usbforge list --all` to see ids/paths")
         })?;
 
     // ---- safety guards ----------------------------------------------------
@@ -286,6 +288,9 @@ impl Reporter for CliReporter {
         eprintln!("[{level}] {message}");
     }
     fn progress(&self, operation: &str, fraction: f32) {
-        eprint!("\r{operation}: {:>3.0}%", (fraction * 100.0).clamp(0.0, 100.0));
+        eprint!(
+            "\r{operation}: {:>3.0}%",
+            (fraction * 100.0).clamp(0.0, 100.0)
+        );
     }
 }

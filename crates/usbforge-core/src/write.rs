@@ -167,7 +167,7 @@ mod tests {
     use super::*;
     use crate::disk::BlockDevice;
     use crate::report::NullReporter;
-    use std::io::{Cursor, Write as _};
+    use std::io::Cursor;
 
     /// An in-memory fixed-size block device for tests (never touches hardware).
     struct MemDevice {
@@ -249,8 +249,8 @@ mod tests {
         let img = temp_image("usbforge_write_toobig.img", &payload);
         let mut dev = MemDevice::new(1024 * 1024); // smaller than image
 
-        let err = write_image_file(&img, &mut dev, &WriteOptions::default(), &NullReporter)
-            .unwrap_err();
+        let err =
+            write_image_file(&img, &mut dev, &WriteOptions::default(), &NullReporter).unwrap_err();
         assert!(matches!(err, Error::Refused(_)));
         let _ = std::fs::remove_file(&img);
     }

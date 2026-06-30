@@ -39,9 +39,9 @@ impl DiskAccess for LinuxDiskAccess {
             }
         }
 
-        let file = opts.open(&device.path).map_err(|e| {
-            Error::Device(format!("cannot open {}: {e}", device.path))
-        })?;
+        let file = opts
+            .open(&device.path)
+            .map_err(|e| Error::Device(format!("cannot open {}: {e}", device.path)))?;
 
         Ok(Box::new(LinuxBlockDevice {
             file,

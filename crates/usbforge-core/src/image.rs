@@ -62,9 +62,7 @@ fn classify_by_extension(path: &Path) -> ImageKind {
     match ext.as_str() {
         "iso" => ImageKind::Iso,
         "img" | "raw" | "dd" | "bin" => ImageKind::RawDisk,
-        "gz" | "xz" | "zst" | "zstd" | "bz2" | "lz4" | "lzma" | "z" => {
-            ImageKind::CompressedDisk
-        }
+        "gz" | "xz" | "zst" | "zstd" | "bz2" | "lz4" | "lzma" | "z" => ImageKind::CompressedDisk,
         "vhd" | "vhdx" => ImageKind::Vhd,
         _ => ImageKind::Unknown,
     }

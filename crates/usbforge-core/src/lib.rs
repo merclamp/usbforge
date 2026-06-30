@@ -23,6 +23,7 @@ pub mod filesystem;
 pub mod format;
 pub mod hash;
 pub mod image;
+pub mod iso;
 pub mod layout;
 pub mod report;
 pub mod write;

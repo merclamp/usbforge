@@ -46,11 +46,19 @@ cargo build
 cargo run -p usbforge-cli -- list           # removable devices only
 cargo run -p usbforge-cli -- list --all     # include fixed disks
 cargo run -p usbforge-cli -- hash path/to/image.iso
-cargo run -p usbforge-cli -- inspect path/to/image.iso
+cargo run -p usbforge-cli -- inspect path/to/disk.iso   # ISOs: label, files, UEFI/BIOS bootability
 
-# Write a raw image to a device (DESTRUCTIVE). Needs root; prompts for
-# confirmation unless --yes. Refuses fixed/system disks unless --allow-fixed.
+# The destructive operations need root, prompt for confirmation unless --yes,
+# and refuse fixed/system disks unless --allow-fixed.
+
+# Raw (dd-style) write of an image to a device, with read-back verification:
 sudo target/release/usbforge write path/to/image.iso /dev/sdX
+
+# Partition + format a device (GPT/MBR, FAT32):
+sudo target/release/usbforge format /dev/sdX --scheme gpt --fs fat32 --label MYUSB
+
+# Create a UEFI-bootable USB from an ISO (file-copy onto a FAT32 ESP):
+sudo target/release/usbforge create path/to/distro.iso /dev/sdX
 
 cargo test
 ```

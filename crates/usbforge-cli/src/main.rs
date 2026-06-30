@@ -17,6 +17,7 @@ use usbforge_core::filesystem::{FileSystem, PartitionScheme};
 use usbforge_core::format::{self, PartitionSlice};
 use usbforge_core::hash::{self, Algo};
 use usbforge_core::image::{ImageInfo, ImageKind};
+use usbforge_core::iso::IsoReader;
 use usbforge_core::layout;
 use usbforge_core::report::{Level, Reporter};
 use usbforge_core::write::{self, WriteOptions};
@@ -90,6 +91,25 @@ enum Command {
         #[arg(long)]
         allow_fixed: bool,
     },
+    /// Create a (UEFI-)bootable USB from an ISO by file-copy. DESTROYS all data.
+    Create {
+        /// Source ISO image.
+        iso: String,
+        /// Target device path or id (e.g. /dev/sdb or sdb). See `list --all`.
+        device: String,
+        /// Partition scheme.
+        #[arg(long, value_enum, default_value = "gpt")]
+        scheme: SchemeArg,
+        /// Volume label (default: the ISO's label, else USBFORGE).
+        #[arg(long)]
+        label: Option<String>,
+        /// Skip the interactive confirmation prompt (required for scripts).
+        #[arg(long)]
+        yes: bool,
+        /// Permit writing to a non-removable (fixed/internal) disk.
+        #[arg(long)]
+        allow_fixed: bool,
+    },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -141,6 +161,14 @@ fn main() -> Result<()> {
             yes,
             allow_fixed,
         } => cmd_format(&device, scheme, fs, label, yes, allow_fixed),
+        Command::Create {
+            iso,
+            device,
+            scheme,
+            label,
+            yes,
+            allow_fixed,
+        } => cmd_create(&iso, &device, scheme, label, yes, allow_fixed),
     }
 }
 
@@ -194,6 +222,37 @@ fn cmd_inspect(path: &str) -> Result<()> {
         info.size
     );
     println!("  kind: {}", info.kind.label());
+
+    if matches!(info.kind, ImageKind::Iso) {
+        match IsoReader::open(path) {
+            Ok(reader) => {
+                let r = reader.report();
+                if !r.volume_label.is_empty() {
+                    println!("  volume label: {}", r.volume_label);
+                }
+                println!(
+                    "  contents: {} files, {}",
+                    r.total_files,
+                    humanize_bytes(r.total_bytes)
+                );
+                println!(
+                    "  UEFI boot: {}",
+                    if r.is_uefi_bootable() {
+                        r.uefi_archs.join(", ")
+                    } else {
+                        "no".to_string()
+                    }
+                );
+                if r.windows_installer {
+                    println!("  Windows installer: yes");
+                }
+                if let Some(b) = &r.bios_bootloader {
+                    println!("  BIOS bootloader: {b}");
+                }
+            }
+            Err(e) => println!("  (ISO9660 parse failed: {e})"),
+        }
+    }
     Ok(())
 }
 
@@ -373,7 +432,7 @@ fn cmd_format(
         .open(&device, Access::ReadWriteExclusive)
         .context("failed to open device (need elevated privileges?)")?;
 
-    let region = layout::write_single_partition(&mut *target, scheme, fs_kind, &label)?;
+    let region = layout::write_single_partition(&mut *target, scheme, fs_kind, &label, false)?;
     eprintln!(
         "Partition table written ({scheme:?}); data partition at offset {} ({}).",
         region.start,
@@ -394,6 +453,100 @@ fn cmd_format(
     println!(
         "Done — {} formatted as {fs_kind} ({scheme:?}).",
         device.path
+    );
+    Ok(())
+}
+
+fn cmd_create(
+    iso_path: &str,
+    device_arg: &str,
+    scheme: SchemeArg,
+    label: Option<String>,
+    yes: bool,
+    allow_fixed: bool,
+) -> Result<()> {
+    let reader = IsoReader::open(iso_path).context("failed to open ISO")?;
+    let report = reader.report();
+    let scheme: PartitionScheme = scheme.into();
+
+    eprintln!("\nSource ISO: {iso_path}");
+    eprintln!(
+        "  label: {}",
+        if report.volume_label.is_empty() {
+            "(none)"
+        } else {
+            &report.volume_label
+        }
+    );
+    eprintln!(
+        "  contents: {} files, {}",
+        report.total_files,
+        humanize_bytes(report.total_bytes)
+    );
+    eprintln!(
+        "  UEFI bootable: {}",
+        if report.is_uefi_bootable() {
+            report.uefi_archs.join(", ")
+        } else {
+            "no (no /EFI/BOOT/BOOT*.EFI found)".to_string()
+        }
+    );
+    if report.windows_installer {
+        eprintln!("  Windows installer detected");
+    }
+    if let Some(b) = &report.bios_bootloader {
+        eprintln!("  BIOS bootloader: {b} (BIOS-only boot needs a loader install — not yet implemented; UEFI works)");
+    }
+
+    // Label: explicit flag > ISO volume label > default.
+    let label = label
+        .filter(|s| !s.is_empty())
+        .or_else(|| (!report.volume_label.is_empty()).then(|| report.volume_label.clone()))
+        .unwrap_or_else(|| "USBFORGE".to_string());
+
+    let device = resolve_target(device_arg, allow_fixed)?;
+    if report.total_bytes > device.size {
+        bail!(
+            "ISO contents ({}) don't fit on device {} ({})",
+            humanize_bytes(report.total_bytes),
+            device.path,
+            device.size_human()
+        );
+    }
+
+    eprintln!("\nAbout to CREATE bootable media:");
+    eprintln!(
+        "  target: {}  [{}]  {}  {}",
+        device.path,
+        device.bus,
+        device.size_human(),
+        device.display_name()
+    );
+    eprintln!("  scheme: {scheme:?}    fs: FAT32    label: {label}");
+    eprintln!(
+        "\n  !! ALL DATA ON {} WILL BE PERMANENTLY DESTROYED. !!",
+        device.path
+    );
+    confirm_destruction(yes, &device.path)?;
+
+    let mut target = usbforge_platform::disk_access()
+        .open(&device, Access::ReadWriteExclusive)
+        .context("failed to open device (need elevated privileges?)")?;
+
+    let reporter = CliReporter::new();
+    let stats = reader.install_to_device(&mut *target, scheme, &label, &reporter)?;
+    target.sync()?;
+    eprintln!();
+
+    println!(
+        "Done — copied {} files ({}). UEFI-bootable: {}.",
+        stats.files,
+        humanize_bytes(stats.bytes),
+        if report.is_uefi_bootable() {
+            "yes"
+        } else {
+            "no (ISO has no UEFI boot files)"
+        }
     );
     Ok(())
 }

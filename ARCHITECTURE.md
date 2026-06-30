@@ -116,8 +116,13 @@ These surface in the UI as disabled/explained options rather than silent gaps.
   write-protected, size check, typed confirmation). _Still TODO: `O_DIRECT` +
   aligned I/O for throughput, `BLKRRPART`/volume locking, compressed sources._
 - **M2 — Partitioning + format:** GPT/MBR via `gpt`/`mbrman`; FAT32/exFAT/ext4.
-- **M3 — Bootloaders + ISO:** ISO9660 extract; ms-sys boot records; syslinux,
-  GRUB, UEFI:NTFS.
+- **M3 — ISO + UEFI file-copy (done):** ISO9660 read/scan via `cdfs`
+  (`core::iso`: volume label, file/byte totals, UEFI-arch + Windows-installer +
+  BIOS-loader detection); recursive extraction into a FAT32 volume via `fatfs`;
+  CLI `create` = GPT(+PMBR)/MBR with an **EFI System Partition** + FAT32 + ISO
+  extraction → UEFI-bootable media. Verified on hardware with a real Alpine ISO
+  (114 files, bootable ESP). _Still TODO: BIOS-only boot (syslinux/GRUB + ms-sys
+  boot records), UEFI:NTFS for >4 GB files, isohybrid passthrough._
 - **M4 — Windows backend:** SetupAPI enumeration + `DeviceIoControl` disk access
   so the core runs on Windows.
 - **M5 — Windows UX:** WIM apply, TPM/Secure-Boot bypass via `hivex`, unattend,

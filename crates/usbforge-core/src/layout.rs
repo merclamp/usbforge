@@ -31,15 +31,20 @@ pub struct PartitionRegion {
 }
 
 /// Write a fresh partition table with a single data partition.
+///
+/// When `efi_system` is set, the partition is typed as an EFI System Partition
+/// (GPT type `C12A7328-…`, MBR type `0xEF`) so UEFI firmware will look in it for
+/// `/EFI/BOOT/BOOT*.EFI`. Otherwise it is a plain data partition.
 pub fn write_single_partition(
     target: &mut dyn BlockDevice,
     scheme: PartitionScheme,
     fs: FileSystem,
     label: &str,
+    efi_system: bool,
 ) -> Result<PartitionRegion> {
     match scheme {
-        PartitionScheme::Gpt => write_gpt(target, label),
-        PartitionScheme::Mbr => write_mbr(target, fs),
+        PartitionScheme::Gpt => write_gpt(target, label, efi_system),
+        PartitionScheme::Mbr => write_mbr(target, fs, efi_system),
     }
 }
 
@@ -47,9 +52,19 @@ pub fn write_single_partition(
 // GPT
 // ---------------------------------------------------------------------------
 
-fn write_gpt(target: &mut dyn BlockDevice, label: &str) -> Result<PartitionRegion> {
+fn write_gpt(
+    target: &mut dyn BlockDevice,
+    label: &str,
+    efi_system: bool,
+) -> Result<PartitionRegion> {
     use gpt::disk::LogicalBlockSize;
     use gpt::{partition_types, GptConfig};
+
+    let part_type = if efi_system {
+        partition_types::EFI
+    } else {
+        partition_types::BASIC
+    };
 
     let dev_size = target.size();
     let total_lba = dev_size / SECTOR;
@@ -71,13 +86,7 @@ fn write_gpt(target: &mut dyn BlockDevice, label: &str) -> Result<PartitionRegio
             .map_err(|e| Error::Other(format!("GPT init failed: {e}")))?;
 
         let id = disk
-            .add_partition(
-                label,
-                usable,
-                partition_types::BASIC,
-                0,
-                Some(ALIGN_BYTES / SECTOR),
-            )
+            .add_partition(label, usable, part_type, 0, Some(ALIGN_BYTES / SECTOR))
             .map_err(|e| Error::Other(format!("GPT add_partition failed: {e}")))?;
 
         let part = disk
@@ -156,7 +165,11 @@ impl Seek for GptDev<'_> {
 // MBR
 // ---------------------------------------------------------------------------
 
-fn write_mbr(target: &mut dyn BlockDevice, fs: FileSystem) -> Result<PartitionRegion> {
+fn write_mbr(
+    target: &mut dyn BlockDevice,
+    fs: FileSystem,
+    efi_system: bool,
+) -> Result<PartitionRegion> {
     let dev_size = target.size();
     let start_lba: u64 = ALIGN_BYTES / SECTOR; // 2048
     let total_lba = dev_size / SECTOR;
@@ -166,7 +179,7 @@ fn write_mbr(target: &mut dyn BlockDevice, fs: FileSystem) -> Result<PartitionRe
     // MBR sector counts are 32-bit (caps usable size at ~2 TiB — fine for UFDs).
     let count_lba = u32::try_from((total_lba - start_lba).min(u32::MAX as u64)).unwrap();
 
-    let type_byte = mbr_type_byte(fs);
+    let type_byte = if efi_system { 0xEF } else { mbr_type_byte(fs) };
 
     let mut sector = [0u8; 512];
     let e = 446; // first partition entry
@@ -213,6 +226,7 @@ mod tests {
             PartitionScheme::Gpt,
             FileSystem::Fat32,
             "USBFORGE",
+            true,
         )
         .unwrap();
         assert!(region.start >= ALIGN_BYTES);
@@ -238,8 +252,14 @@ mod tests {
     #[test]
     fn mbr_single_partition_layout() {
         let mut dev = MemDevice::new(64 * 1024 * 1024);
-        let region =
-            write_single_partition(&mut dev, PartitionScheme::Mbr, FileSystem::Fat32, "X").unwrap();
+        let region = write_single_partition(
+            &mut dev,
+            PartitionScheme::Mbr,
+            FileSystem::Fat32,
+            "X",
+            false,
+        )
+        .unwrap();
         assert_eq!(region.start, 2048 * 512);
         let b = dev.data();
         assert_eq!(b[510], 0x55);

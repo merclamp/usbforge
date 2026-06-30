@@ -17,7 +17,7 @@ use usbforge_core::filesystem::{FileSystem, PartitionScheme};
 use usbforge_core::format::{self, PartitionSlice};
 use usbforge_core::hash::{self, Algo};
 use usbforge_core::image::{ImageInfo, ImageKind};
-use usbforge_core::iso::IsoReader;
+use usbforge_core::iso::{self, IsoReader};
 use usbforge_core::layout;
 use usbforge_core::report::{Level, Reporter};
 use usbforge_core::write::{self, WriteOptions};
@@ -249,6 +249,10 @@ fn cmd_inspect(path: &str) -> Result<()> {
                 if let Some(b) = &r.bios_bootloader {
                     println!("  BIOS bootloader: {b}");
                 }
+                println!(
+                    "  isohybrid (raw write boots BIOS+UEFI): {}",
+                    if r.isohybrid { "yes" } else { "no" }
+                );
             }
             Err(e) => println!("  (ISO9660 parse failed: {e})"),
         }
@@ -300,6 +304,9 @@ fn cmd_write(
     let info = ImageInfo::inspect(image).context("failed to inspect image")?;
     if matches!(info.kind, ImageKind::CompressedDisk) {
         bail!("compressed images are not supported yet (planned for M3) — decompress it first");
+    }
+    if matches!(info.kind, ImageKind::Iso) && iso::is_isohybrid(image) {
+        eprintln!("Note: isohybrid ISO — the resulting drive will boot on both BIOS and UEFI.");
     }
 
     let device = resolve_target(device_arg, allow_fixed)?;
@@ -495,7 +502,15 @@ fn cmd_create(
         eprintln!("  Windows installer detected");
     }
     if let Some(b) = &report.bios_bootloader {
-        eprintln!("  BIOS bootloader: {b} (BIOS-only boot needs a loader install — not yet implemented; UEFI works)");
+        eprintln!("  BIOS bootloader: {b}");
+    }
+    if report.isohybrid {
+        eprintln!(
+            "  isohybrid: yes — for BIOS-machine boot, use `usbforge write {iso_path} {device_arg}`\n\
+             (raw mode boots BIOS+UEFI). The file-copy create below is UEFI-boot only."
+        );
+    } else if report.bios_bootloader.is_some() {
+        eprintln!("  (BIOS-only boot for non-isohybrid ISOs needs a syslinux/GRUB install — not yet implemented; UEFI works.)");
     }
 
     // Label: explicit flag > ISO volume label > default.

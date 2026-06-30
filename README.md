@@ -60,6 +60,10 @@ sudo target/release/usbforge format /dev/sdX --scheme gpt --fs fat32 --label MYU
 # Create a UEFI-bootable USB from an ISO (file-copy onto a FAT32 ESP):
 sudo target/release/usbforge create path/to/distro.iso /dev/sdX
 
+# For BIOS *and* UEFI boot of an isohybrid ISO (most Linux distros), raw-write it
+# — `inspect` reports "isohybrid: yes" when this applies:
+sudo target/release/usbforge write path/to/distro.iso /dev/sdX
+
 cargo test
 ```
 

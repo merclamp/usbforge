@@ -38,12 +38,33 @@ pub struct IsoReport {
     pub windows_installer: bool,
     /// Detected BIOS bootloader, if any (`"isolinux"` / `"grub"`).
     pub bios_bootloader: Option<String>,
+    /// The ISO is "isohybrid": it carries a real MBR boot sector, so writing it
+    /// raw (dd) to a USB yields a drive that boots on BIOS *and* UEFI.
+    pub isohybrid: bool,
 }
 
 impl IsoReport {
     pub fn is_uefi_bootable(&self) -> bool {
         !self.uefi_archs.is_empty()
     }
+}
+
+/// Cheap isohybrid check: read LBA0 and look for an MBR boot signature
+/// (`0x55AA`) plus non-empty boot code. Plain ISO9660 leaves the first 16
+/// sectors (the "system area") zeroed, so a populated MBR here means isohybrid.
+/// Returns `false` on any I/O error.
+pub fn is_isohybrid(path: impl AsRef<Path>) -> bool {
+    let mut file = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut lba0 = [0u8; 512];
+    if file.read_exact(&mut lba0).is_err() {
+        return false;
+    }
+    let has_signature = lba0[510] == 0x55 && lba0[511] == 0xAA;
+    let has_bootcode = lba0[..440].iter().any(|&b| b != 0);
+    has_signature && has_bootcode
 }
 
 /// Result of an extraction pass.
@@ -72,6 +93,7 @@ impl IsoReader {
             uefi_archs: self.detect_uefi(),
             windows_installer: self.exists_any(&["/sources/install.wim", "/sources/install.esd"]),
             bios_bootloader: self.detect_bios_bootloader(),
+            isohybrid: is_isohybrid(&self.path),
         }
     }
 
@@ -287,6 +309,26 @@ mod tests {
         assert_eq!(clean_name("README.TXT;1"), "README.TXT");
         assert_eq!(clean_name("DIR."), "DIR");
         assert_eq!(clean_name("file"), "file");
+    }
+
+    #[test]
+    fn isohybrid_detection() {
+        let p = std::env::temp_dir().join(format!("usbforge_isohybrid_{}.bin", std::process::id()));
+
+        // MBR boot signature + non-zero boot code -> isohybrid.
+        let mut buf = vec![0u8; 2048];
+        buf[0] = 0xEB;
+        buf[1] = 0x63;
+        buf[510] = 0x55;
+        buf[511] = 0xAA;
+        std::fs::write(&p, &buf).unwrap();
+        assert!(is_isohybrid(&p));
+
+        // All zero (plain ISO system area) -> not isohybrid.
+        std::fs::write(&p, vec![0u8; 2048]).unwrap();
+        assert!(!is_isohybrid(&p));
+
+        let _ = std::fs::remove_file(&p);
     }
 
     /// End-to-end: build a tiny ISO, read it, extract into a FAT32 volume, and

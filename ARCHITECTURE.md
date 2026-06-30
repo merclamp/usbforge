@@ -121,8 +121,14 @@ These surface in the UI as disabled/explained options rather than silent gaps.
   BIOS-loader detection); recursive extraction into a FAT32 volume via `fatfs`;
   CLI `create` = GPT(+PMBR)/MBR with an **EFI System Partition** + FAT32 + ISO
   extraction → UEFI-bootable media. Verified on hardware with a real Alpine ISO
-  (114 files, bootable ESP). _Still TODO: BIOS-only boot (syslinux/GRUB + ms-sys
-  boot records), UEFI:NTFS for >4 GB files, isohybrid passthrough._
+  (114 files, bootable ESP).
+  **BIOS boot via isohybrid (done):** `core::iso::is_isohybrid` detects ISOs that
+  carry a real MBR boot sector; `inspect`/`create` surface it and `write` notes
+  it. For such ISOs (Alpine and most Linux distros) a raw `write` boots on BIOS
+  *and* UEFI using the ISO's own tested loader — verified on hardware (isolinux
+  MBR + El Torito ESP). _Still TODO: a pure-Rust syslinux/GRUB installer for the
+  file-copy path / non-isohybrid ISOs (needs a FAT extent mapper + boot-record
+  patching; can't be boot-tested in this environment), UEFI:NTFS for >4 GB files._
 - **M4 — Windows backend:** SetupAPI enumeration + `DeviceIoControl` disk access
   so the core runs on Windows.
 - **M5 — Windows UX:** WIM apply, TPM/Secure-Boot bypass via `hivex`, unattend,

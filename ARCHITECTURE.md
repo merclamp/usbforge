@@ -135,9 +135,16 @@ These surface in the UI as disabled/explained options rather than silent gaps.
   with host `mkfs.ntfs`, mounts it and copies the ISO tree in
   (`iso::extract_to_dir`). Lets UEFI boot from media whose files exceed FAT32's
   4 GiB limit (Windows ISOs). Verified on hardware (NTFS main + UEFI:NTFS ESP
-  with x64/aa64/… bootloaders). _Still TODO: a pure-Rust syslinux/GRUB installer
-  for non-isohybrid BIOS boot; UDF reading for real Windows ISOs (cdfs is
-  ISO9660-only); NTFS format/copy currently uses host ntfs-3g (Linux)._
+  with x64/aa64/… bootloaders).
+  **UDF reading (done):** `iso::is_udf` detects UDF / ISO9660+UDF-bridge images
+  (NSR02/NSR03 in the Volume Recognition Sequence — that's how Windows ISOs hold
+  install.wim > 4 GiB). The NTFS create path reads the source via a kernel
+  loop-mount (`mount -t udf`, falling back to autodetect), which yields the full
+  UDF view incl. > 4 GiB files; `create` is tolerant of pure-UDF ISOs that cdfs
+  can't parse. Mount-based copy verified on hardware. _Still TODO: a pure-Rust
+  syslinux/GRUB installer for non-isohybrid BIOS boot; NTFS format/copy + UDF
+  mount currently use host tools (ntfs-3g, kernel udf) on Linux — the Windows
+  backend will use native APIs._
 - **M4 — Windows backend:** SetupAPI enumeration + `DeviceIoControl` disk access
   so the core runs on Windows.
 - **M5 — Windows UX:** WIM apply, TPM/Secure-Boot bypass via `hivex`, unattend,

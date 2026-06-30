@@ -41,12 +41,36 @@ pub struct IsoReport {
     /// The ISO is "isohybrid": it carries a real MBR boot sector, so writing it
     /// raw (dd) to a USB yields a drive that boots on BIOS *and* UEFI.
     pub isohybrid: bool,
+    /// The image uses UDF (so it may hold files > 4 GiB, e.g. Windows ISOs).
+    pub udf: bool,
 }
 
 impl IsoReport {
     pub fn is_uefi_bootable(&self) -> bool {
         !self.uefi_archs.is_empty()
     }
+}
+
+/// Detect whether an image uses **UDF** — including ISO9660+UDF "bridge" images,
+/// which is how Windows ISOs store an `install.wim` larger than ISO9660's 4 GiB
+/// per-file limit. Looks for an `NSR02`/`NSR03` standard identifier in the Volume
+/// Recognition Sequence (the 2048-byte sectors starting at sector 16). No root
+/// needed. Returns `false` on any I/O error.
+pub fn is_udf(path: impl AsRef<Path>) -> bool {
+    let mut file = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    if file.seek(SeekFrom::Start(16 * 2048)).is_err() {
+        return false;
+    }
+    // The Volume Recognition Sequence lives in the first handful of sectors.
+    let mut buf = vec![0u8; 16 * 2048];
+    let n = match file.read(&mut buf) {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    buf[..n].windows(5).any(|w| w == b"NSR02" || w == b"NSR03")
 }
 
 /// Cheap isohybrid check: read LBA0 and look for an MBR boot signature
@@ -94,6 +118,7 @@ impl IsoReader {
             windows_installer: self.exists_any(&["/sources/install.wim", "/sources/install.esd"]),
             bios_bootloader: self.detect_bios_bootloader(),
             isohybrid: is_isohybrid(&self.path),
+            udf: is_udf(&self.path),
         }
     }
 
@@ -380,6 +405,24 @@ mod tests {
         // All zero (plain ISO system area) -> not isohybrid.
         std::fs::write(&p, vec![0u8; 2048]).unwrap();
         assert!(!is_isohybrid(&p));
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn udf_detection() {
+        let p = std::env::temp_dir().join(format!("usbforge_udf_{}.bin", std::process::id()));
+
+        // NSR02 in the volume recognition sequence (sector 17 here) -> UDF.
+        let mut buf = vec![0u8; 20 * 2048];
+        buf[17 * 2048] = 0x00; // structure type
+        buf[17 * 2048 + 1..17 * 2048 + 6].copy_from_slice(b"NSR02");
+        std::fs::write(&p, &buf).unwrap();
+        assert!(is_udf(&p));
+
+        // Plain ISO9660 (no NSR) -> not UDF.
+        std::fs::write(&p, vec![0u8; 20 * 2048]).unwrap();
+        assert!(!is_udf(&p));
 
         let _ = std::fs::remove_file(&p);
     }

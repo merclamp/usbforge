@@ -264,8 +264,17 @@ fn cmd_inspect(path: &str) -> Result<()> {
                     "  isohybrid (raw write boots BIOS+UEFI): {}",
                     if r.isohybrid { "yes" } else { "no" }
                 );
+                if r.udf {
+                    println!("  UDF: yes (may hold files > 4 GiB; use `create --fs ntfs`)");
+                }
             }
-            Err(e) => println!("  (ISO9660 parse failed: {e})"),
+            Err(e) => {
+                if iso::is_udf(path) {
+                    println!("  UDF image — read it with `create --fs ntfs` (no ISO9660 view)");
+                } else {
+                    println!("  (ISO9660 parse failed: {e})");
+                }
+            }
         }
     }
     Ok(())
@@ -484,71 +493,90 @@ fn cmd_create(
     yes: bool,
     allow_fixed: bool,
 ) -> Result<()> {
-    let reader = IsoReader::open(iso_path).context("failed to open ISO")?;
-    let report = reader.report();
     let scheme: PartitionScheme = scheme.into();
+    let udf = iso::is_udf(iso_path);
+    // cdfs reads ISO9660; pure-UDF Windows ISOs won't parse — fine, the NTFS
+    // path reads them through a kernel mount instead.
+    let reader = IsoReader::open(iso_path).ok();
+    let report = reader.as_ref().map(|r| r.report());
 
     eprintln!("\nSource ISO: {iso_path}");
-    eprintln!(
-        "  label: {}",
-        if report.volume_label.is_empty() {
-            "(none)"
-        } else {
-            &report.volume_label
-        }
-    );
-    eprintln!(
-        "  contents: {} files, {}",
-        report.total_files,
-        humanize_bytes(report.total_bytes)
-    );
-    eprintln!(
-        "  UEFI bootable: {}",
-        if report.is_uefi_bootable() {
-            report.uefi_archs.join(", ")
-        } else {
-            "no (no /EFI/BOOT/BOOT*.EFI found)".to_string()
-        }
-    );
-    if report.windows_installer {
-        eprintln!("  Windows installer detected");
-    }
-    if let Some(b) = &report.bios_bootloader {
-        eprintln!("  BIOS bootloader: {b}");
-    }
-    if report.isohybrid {
+    if let Some(r) = &report {
         eprintln!(
-            "  isohybrid: yes — for BIOS-machine boot, use `usbforge write {iso_path} {device_arg}`\n\
-             (raw mode boots BIOS+UEFI). The file-copy create below is UEFI-boot only."
+            "  label: {}",
+            if r.volume_label.is_empty() {
+                "(none)"
+            } else {
+                &r.volume_label
+            }
         );
-    } else if report.bios_bootloader.is_some() {
-        eprintln!("  (BIOS-only boot for non-isohybrid ISOs needs a syslinux/GRUB install — not yet implemented; UEFI works.)");
+        eprintln!(
+            "  contents: {} files, {}",
+            r.total_files,
+            humanize_bytes(r.total_bytes)
+        );
+        eprintln!(
+            "  UEFI bootable: {}",
+            if r.is_uefi_bootable() {
+                r.uefi_archs.join(", ")
+            } else {
+                "no (no /EFI/BOOT/BOOT*.EFI found)".to_string()
+            }
+        );
+        if r.windows_installer {
+            eprintln!("  Windows installer detected");
+        }
+        if let Some(b) = &r.bios_bootloader {
+            eprintln!("  BIOS bootloader: {b}");
+        }
+        if r.isohybrid {
+            eprintln!(
+                "  isohybrid: yes — for BIOS-machine boot, use `usbforge write {iso_path} {device_arg}`\n\
+                 (raw mode boots BIOS+UEFI). The file-copy create below is UEFI-boot only."
+            );
+        }
+    } else if udf {
+        eprintln!("  UDF image (no ISO9660 view) — will be read via a kernel mount.");
+    } else {
+        bail!("`{iso_path}` is not a readable ISO9660/UDF image");
+    }
+    if udf {
+        eprintln!("  UDF: yes (supports files > 4 GiB)");
     }
 
     // Label: explicit flag > ISO volume label > default.
     let label = label
         .filter(|s| !s.is_empty())
-        .or_else(|| (!report.volume_label.is_empty()).then(|| report.volume_label.clone()))
+        .or_else(|| {
+            report
+                .as_ref()
+                .and_then(|r| (!r.volume_label.is_empty()).then(|| r.volume_label.clone()))
+        })
         .unwrap_or_else(|| "USBFORGE".to_string());
 
-    // NTFS (UEFI:NTFS) for Windows ISOs / big files; FAT32 otherwise.
+    // NTFS (UEFI:NTFS) for Windows / UDF / >4 GiB; FAT32 otherwise.
     let use_ntfs = match fs {
         CreateFs::Ntfs => true,
         CreateFs::Fat32 => false,
-        CreateFs::Auto => report.windows_installer,
+        CreateFs::Auto => udf || report.as_ref().is_some_and(|r| r.windows_installer),
     };
     if use_ntfs && !tool_exists("mkfs.ntfs") {
         bail!("NTFS mode needs `mkfs.ntfs` — install ntfs-3g + ntfsprogs");
     }
+    if !use_ntfs && reader.is_none() {
+        bail!("this image needs NTFS mode (`--fs ntfs`); FAT32 file-copy can't read UDF");
+    }
 
     let device = resolve_target(device_arg, allow_fixed)?;
-    if report.total_bytes > device.size {
-        bail!(
-            "ISO contents ({}) don't fit on device {} ({})",
-            humanize_bytes(report.total_bytes),
-            device.path,
-            device.size_human()
-        );
+    if let Some(r) = &report {
+        if r.total_bytes > device.size {
+            bail!(
+                "ISO contents ({}) don't fit on device {} ({})",
+                humanize_bytes(r.total_bytes),
+                device.path,
+                device.size_human()
+            );
+        }
     }
 
     eprintln!("\nAbout to CREATE bootable media:");
@@ -575,8 +603,9 @@ fn cmd_create(
 
     let reporter = CliReporter::new();
     let summary = if use_ntfs {
-        create_uefi_ntfs(&device, scheme, &reader, &label, &reporter)?
+        create_uefi_ntfs(&device, scheme, iso_path, &label, &reporter)?
     } else {
+        let reader = reader.expect("FAT path requires a readable ISO9660 image");
         let mut target = usbforge_platform::disk_access()
             .open(&device, Access::ReadWriteExclusive)
             .context("failed to open device (need elevated privileges?)")?;
@@ -592,10 +621,10 @@ fn cmd_create(
 
     println!(
         "Done — {summary}. UEFI-bootable: {}.",
-        if report.is_uefi_bootable() {
-            "yes"
-        } else {
-            "no (ISO has no UEFI boot files)"
+        match report.as_ref().map(|r| r.is_uefi_bootable()) {
+            Some(true) => "yes",
+            Some(false) => "no (ISO has no UEFI boot files)",
+            None => "yes (UDF / Windows install media)",
         }
     );
     Ok(())
@@ -607,7 +636,7 @@ fn cmd_create(
 fn create_uefi_ntfs(
     device: &Device,
     scheme: PartitionScheme,
-    reader: &IsoReader,
+    iso_path: &str,
     label: &str,
     reporter: &CliReporter,
 ) -> Result<String> {
@@ -652,24 +681,104 @@ fn create_uefi_ntfs(
     eprintln!("Formatting {part} as NTFS …");
     run_tool("mkfs.ntfs", &["-Q", "-F", "-L", label, &part]).context("mkfs.ntfs failed")?;
 
-    // 4) Mount, copy the ISO tree in, unmount.
+    // 4) Mount the NTFS target, copy the (mounted) ISO tree in, unmount.
     let mnt = std::env::temp_dir().join(format!("usbforge_ntfs_{}", std::process::id()));
     std::fs::create_dir_all(&mnt)?;
     let mnt_str = mnt.to_string_lossy().to_string();
     run_tool("mount", &["-t", "ntfs-3g", &part, &mnt_str]).context("mounting NTFS failed")?;
 
-    let extract = reader.extract_to_dir(&mnt, reporter);
+    let extract = mount_copy_iso(iso_path, &mnt, reporter);
 
     let _ = std::process::Command::new("sync").status();
     let _ = std::process::Command::new("umount").arg(&mnt_str).status();
     let _ = std::fs::remove_dir_all(&mnt);
 
-    let stats = extract?;
+    let (files, bytes) = extract?;
     Ok(format!(
-        "copied {} files ({}) to NTFS + wrote UEFI:NTFS bootloader",
-        stats.files,
-        humanize_bytes(stats.bytes)
+        "copied {files} files ({}) to NTFS + wrote UEFI:NTFS bootloader",
+        humanize_bytes(bytes)
     ))
+}
+
+/// Loop-mount an ISO read-only (UDF view preferred, so > 4 GiB files come
+/// through; falls back to autodetect for plain ISO9660) and copy its tree into
+/// `dest`. Returns `(file_count, byte_total)`.
+fn mount_copy_iso(
+    iso_path: &str,
+    dest: &std::path::Path,
+    reporter: &CliReporter,
+) -> Result<(u64, u64)> {
+    let mnt = std::env::temp_dir().join(format!("usbforge_src_{}", std::process::id()));
+    std::fs::create_dir_all(&mnt)?;
+    let mnt_str = mnt.to_string_lossy().to_string();
+
+    // Probe the UDF view first (quietly — it's expected to fail on plain ISO9660).
+    let udf_ok = std::process::Command::new("mount")
+        .args(["-t", "udf", "-o", "loop,ro", iso_path, &mnt_str])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !udf_ok {
+        run_tool("mount", &["-o", "loop,ro", iso_path, &mnt_str])
+            .context("loop-mounting the source ISO failed")?;
+    }
+
+    let total = dir_size(&mnt);
+    let mut done = 0u64;
+    let mut files = 0u64;
+    let result = copy_tree(&mnt, dest, total, &mut done, &mut files, reporter);
+
+    let _ = std::process::Command::new("umount").arg(&mnt_str).status();
+    let _ = std::fs::remove_dir_all(&mnt);
+
+    result?;
+    Ok((files, done))
+}
+
+/// Recursively copy `src` into `dst`, reporting progress against `total` bytes.
+fn copy_tree(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    total: u64,
+    done: &mut u64,
+    files: &mut u64,
+    reporter: &CliReporter,
+) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let path = entry.path();
+        let target = dst.join(entry.file_name());
+        let ft = entry.file_type()?;
+        if ft.is_dir() {
+            copy_tree(&path, &target, total, done, files, reporter)?;
+        } else if ft.is_file() {
+            std::fs::copy(&path, &target).with_context(|| format!("copying {}", path.display()))?;
+            *files += 1;
+            *done += entry.metadata().map(|m| m.len()).unwrap_or(0);
+            if total > 0 {
+                reporter.progress("extract", *done as f32 / total as f32);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Recursively sum the byte size of all regular files under `p`.
+fn dir_size(p: &std::path::Path) -> u64 {
+    let mut total = 0;
+    if let Ok(entries) = std::fs::read_dir(p) {
+        for e in entries.flatten() {
+            match e.file_type() {
+                Ok(ft) if ft.is_dir() => total += dir_size(&e.path()),
+                Ok(ft) if ft.is_file() => total += e.metadata().map(|m| m.len()).unwrap_or(0),
+                _ => {}
+            }
+        }
+    }
+    total
 }
 
 /// Is an executable of this name on PATH?

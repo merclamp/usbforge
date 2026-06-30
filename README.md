@@ -29,6 +29,16 @@ reporting seams instead of global `uprintf()` / `SendMessage` glue.
 | `usbforge-cli` | Headless frontend + proof-of-concept (`usbforge` binary). |
 | `usbforge-gui` | Graphical frontend (placeholder for now). |
 
+## Contributing (two-person, cross-platform)
+
+The project is developed in parallel on Linux and Windows. Shared, OS-neutral
+code lives in `usbforge-core` and the frontends; OS-specific code lives only in
+`usbforge-platform` behind `cfg(target_os)`. The trait set in `usbforge-core` is
+the contract both backends implement. See **[`docs/WORK-SPLIT.md`](docs/WORK-SPLIT.md)**
+for the full ownership map, per-milestone split, and a Windows quick-start.
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) builds + tests on
+both Linux and Windows on every push.
+
 ## Build & run
 
 ```sh

@@ -22,6 +22,11 @@ cross-platform (Linux + Windows) application.
    maintained Rust crate; fall back to FFI against the upstream C library;
    reimplement only when neither exists.
 
+> **Working in parallel on Linux and Windows?** The trait boundary in
+> `usbforge-core` is the contract both backends implement. See
+> [`docs/WORK-SPLIT.md`](docs/WORK-SPLIT.md) for ownership and the per-milestone
+> Linux/Windows split.
+
 ## 2. Layering
 
 ```

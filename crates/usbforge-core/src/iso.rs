@@ -7,7 +7,7 @@
 //! `/EFI/BOOT/BOOT*.EFI` straight from the FAT32 partition, no bootloader install.
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use cdfs::{DirectoryEntry, ISODirectory, ISO9660};
@@ -192,17 +192,19 @@ impl IsoReader {
             region.start,
             crate::device::humanize_bytes(region.len)
         ));
-        self.install_to_region(target, region, label, reporter)
+        self.install_to_region(target, region, label, None, reporter)
     }
 
     /// Format an existing partition region as FAT32 and extract the ISO tree
     /// into it. Used both for the single-partition install and as the boot
-    /// partition of a persistence layout.
+    /// partition of a persistence layout. When `persistence` is set, the live
+    /// distro's boot configs are patched to enable the overlay.
     pub fn install_to_region(
         &self,
         target: &mut dyn BlockDevice,
         region: layout::PartitionRegion,
         label: &str,
+        persistence: Option<PersistenceKind>,
         reporter: &dyn Reporter,
     ) -> Result<ExtractStats> {
         let mut slice = PartitionSlice::new(target, region.start, region.len);
@@ -210,6 +212,15 @@ impl IsoReader {
         let fs = FileSystem::new(&mut slice, fat_options())
             .map_err(|e| Error::Other(format!("mounting new FAT volume: {e}")))?;
         let stats = self.extract_to_fat(&fs, reporter)?;
+        if let Some(kind) = persistence {
+            match inject_persistence_param(&fs, kind) {
+                Ok(0) => reporter.warn(
+                    "No boot config found to enable persistence (overlay partition still created).",
+                ),
+                Ok(n) => reporter.info(&format!("Enabled persistence in {n} boot config(s).")),
+                Err(e) => reporter.warn(&format!("Persistence boot-config edit failed: {e}")),
+            }
+        }
         fs.unmount()
             .map_err(|e| Error::Other(format!("finalising FAT volume: {e}")))?;
         Ok(stats)
@@ -390,6 +401,91 @@ fn dir_totals(dir: &ISODirectory<File>) -> (u64, u64) {
     (files, bytes)
 }
 
+/// Boot configs commonly carrying the live kernel command line (paths are
+/// matched case-insensitively by FAT).
+const BOOT_CONFIGS: [&str; 9] = [
+    "boot/grub/grub.cfg",
+    "boot/grub/loopback.cfg",
+    "EFI/BOOT/grub.cfg",
+    "isolinux/isolinux.cfg",
+    "isolinux/txt.cfg",
+    "boot/isolinux/isolinux.cfg",
+    "syslinux/syslinux.cfg",
+    "syslinux/txt.cfg",
+    "boot/syslinux/syslinux.cfg",
+];
+
+/// Patch the live distro's boot configs on `fs` to add the persistence kernel
+/// parameter (`persistent` for casper, `persistence` for live-boot). Returns the
+/// number of config files changed.
+fn inject_persistence_param<W: ReadWriteSeek>(
+    fs: &FileSystem<W>,
+    kind: PersistenceKind,
+) -> Result<usize> {
+    let param = match kind {
+        PersistenceKind::Casper => "persistent",
+        PersistenceKind::LiveBoot => "persistence",
+    };
+    let root = fs.root_dir();
+    let mut edited = 0;
+    for path in BOOT_CONFIGS {
+        if edit_boot_config(&root, path, param)? {
+            edited += 1;
+        }
+    }
+    Ok(edited)
+}
+
+/// Read a config file, add `param` to its kernel command lines, write it back.
+/// Returns `Ok(false)` if the file is absent or already contained the param.
+fn edit_boot_config<W: ReadWriteSeek>(root: &Dir<'_, W>, path: &str, param: &str) -> Result<bool> {
+    let mut file = match root.open_file(path) {
+        Ok(f) => f,
+        Err(_) => return Ok(false),
+    };
+    let mut content = String::new();
+    if file.read_to_string(&mut content).is_err() {
+        return Ok(false);
+    }
+    let patched = add_kernel_param(&content, param);
+    if patched == content {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| Error::Other(format!("seek {path}: {e}")))?;
+    file.truncate()
+        .map_err(|e| Error::Other(format!("truncate {path}: {e}")))?;
+    file.write_all(patched.as_bytes())
+        .map_err(|e| Error::Other(format!("write {path}: {e}")))?;
+    Ok(true)
+}
+
+/// Append `param` to every kernel-loading line (`linux`/`linux16`/`append`/
+/// `kernel`) that doesn't already carry it. casper/live-boot scan the whole
+/// `/proc/cmdline`, so appending at end of line is sufficient.
+fn add_kernel_param(content: &str, param: &str) -> String {
+    let mut out = String::with_capacity(content.len() + 32);
+    for line in content.lines() {
+        let lower = line.trim_start().to_ascii_lowercase();
+        let is_kernel_line = lower.starts_with("linux ")
+            || lower.starts_with("linux\t")
+            || lower.starts_with("linux16 ")
+            || lower.starts_with("append ")
+            || lower.starts_with("append\t")
+            || lower.starts_with("kernel ");
+        let has_param = line.split_whitespace().any(|t| t == param);
+        if is_kernel_line && !has_param {
+            out.push_str(line.trim_end());
+            out.push(' ');
+            out.push_str(param);
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
+}
+
 /// Strip the ISO9660 `;1` version suffix and any trailing dot.
 fn clean_name(raw: &str) -> String {
     let base = raw.split(';').next().unwrap_or(raw);
@@ -456,6 +552,57 @@ mod tests {
         assert!(!is_isohybrid(&p));
 
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn kernel_param_injection_string() {
+        let grub = "menuentry 'Live' {\n  linux /casper/vmlinuz boot=casper quiet splash ---\n  initrd /casper/initrd\n}\n";
+        let out = add_kernel_param(grub, "persistent");
+        assert!(out.contains("quiet splash --- persistent"));
+        assert!(out.contains("initrd /casper/initrd")); // non-kernel line untouched
+        assert_eq!(add_kernel_param(&out, "persistent"), out); // idempotent
+
+        let syslinux = "label live\n  append boot=casper quiet ---\n";
+        assert!(add_kernel_param(syslinux, "persistent").contains("quiet --- persistent"));
+    }
+
+    #[test]
+    fn inject_persistence_into_fat() {
+        let mut dev = MemDevice::new(64 * 1024 * 1024);
+        let cfg = "menuentry 'L' {\n  linux /casper/vmlinuz boot=casper quiet splash\n}\n";
+
+        let len = dev.size();
+        {
+            let mut slice = PartitionSlice::new(&mut dev, 0, len);
+            format_fat32(&mut slice, "TEST").unwrap();
+            let fs = FileSystem::new(&mut slice, fat_options()).unwrap();
+            {
+                let grub = fs
+                    .root_dir()
+                    .create_dir("boot")
+                    .unwrap()
+                    .create_dir("grub")
+                    .unwrap();
+                grub.create_file("grub.cfg")
+                    .unwrap()
+                    .write_all(cfg.as_bytes())
+                    .unwrap();
+            }
+            let n = inject_persistence_param(&fs, PersistenceKind::Casper).unwrap();
+            assert_eq!(n, 1);
+            fs.unmount().unwrap();
+        }
+
+        let len = dev.size();
+        let mut slice = PartitionSlice::new(&mut dev, 0, len);
+        let fs = FileSystem::new(&mut slice, fat_options()).unwrap();
+        let mut s = String::new();
+        fs.root_dir()
+            .open_file("boot/grub/grub.cfg")
+            .unwrap()
+            .read_to_string(&mut s)
+            .unwrap();
+        assert!(s.contains("quiet splash persistent"));
     }
 
     #[test]

@@ -281,6 +281,9 @@ fn cmd_inspect(path: &str) -> Result<()> {
                 if r.udf {
                     println!("  UDF: yes (may hold files > 4 GiB; use `create --fs ntfs`)");
                 }
+                if let Some(k) = r.persistence {
+                    println!("  persistence: {} (use `create --persistence`)", k.label());
+                }
             }
             Err(e) => {
                 if iso::is_udf(path) {
@@ -769,7 +772,7 @@ fn create_persistence(
             humanize_bytes(boot.len),
             humanize_bytes(data.len)
         );
-        let stats = reader.install_to_region(&mut *target, boot, label, reporter)?;
+        let stats = reader.install_to_region(&mut *target, boot, label, kind, reporter)?;
         target.sync()?;
         stats
     };
@@ -809,15 +812,6 @@ fn create_persistence(
         let _ = std::fs::remove_dir_all(&mnt);
         write_res.context("writing persistence.conf failed")?;
     }
-
-    eprintln!(
-        "Note: some distros also need a `{}` kernel parameter in the boot config to activate persistence.",
-        if matches!(kind, Some(usbforge_core::iso::PersistenceKind::LiveBoot)) {
-            "persistence"
-        } else {
-            "persistent"
-        }
-    );
 
     Ok(format!(
         "copied {} files ({}) + created ext4 persistence ({persist_label})",

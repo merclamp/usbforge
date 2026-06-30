@@ -1,0 +1,17 @@
+[package]
+name = "usbforge-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Command-line frontend for USBForge."
+
+[[bin]]
+name = "usbforge"
+path = "src/main.rs"
+
+[dependencies]
+usbforge-core.workspace = true
+usbforge-platform.workspace = true
+clap.workspace = true
+anyhow.workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "usbforge-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Graphical frontend for USBForge (placeholder; GUI toolkit wired up in a later milestone)."
+
+[[bin]]
+name = "usbforge-gui"
+path = "src/main.rs"
+
+[dependencies]
+usbforge-core.workspace = true
+usbforge-platform.workspace = true
+# The GUI toolkit (Slint / iced / egui — see ARCHITECTURE.md) is added here in
+# the GUI milestone. Kept dependency-light for now so `cargo build` needs no
+# system GUI libraries.

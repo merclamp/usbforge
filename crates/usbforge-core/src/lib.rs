@@ -26,6 +26,7 @@ pub mod image;
 pub mod iso;
 pub mod layout;
 pub mod report;
+pub mod uefi_ntfs;
 pub mod write;
 
 #[cfg(test)]

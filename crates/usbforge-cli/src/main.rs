@@ -100,6 +100,9 @@ enum Command {
         /// Partition scheme.
         #[arg(long, value_enum, default_value = "gpt")]
         scheme: SchemeArg,
+        /// Filesystem: auto (NTFS for Windows ISOs, else FAT32), fat32, or ntfs.
+        #[arg(long, value_enum, default_value = "auto")]
+        fs: CreateFs,
         /// Volume label (default: the ISO's label, else USBFORGE).
         #[arg(long)]
         label: Option<String>,
@@ -110,6 +113,13 @@ enum Command {
         #[arg(long)]
         allow_fixed: bool,
     },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum CreateFs {
+    Auto,
+    Fat32,
+    Ntfs,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -165,10 +175,11 @@ fn main() -> Result<()> {
             iso,
             device,
             scheme,
+            fs,
             label,
             yes,
             allow_fixed,
-        } => cmd_create(&iso, &device, scheme, label, yes, allow_fixed),
+        } => cmd_create(&iso, &device, scheme, fs, label, yes, allow_fixed),
     }
 }
 
@@ -468,6 +479,7 @@ fn cmd_create(
     iso_path: &str,
     device_arg: &str,
     scheme: SchemeArg,
+    fs: CreateFs,
     label: Option<String>,
     yes: bool,
     allow_fixed: bool,
@@ -519,6 +531,16 @@ fn cmd_create(
         .or_else(|| (!report.volume_label.is_empty()).then(|| report.volume_label.clone()))
         .unwrap_or_else(|| "USBFORGE".to_string());
 
+    // NTFS (UEFI:NTFS) for Windows ISOs / big files; FAT32 otherwise.
+    let use_ntfs = match fs {
+        CreateFs::Ntfs => true,
+        CreateFs::Fat32 => false,
+        CreateFs::Auto => report.windows_installer,
+    };
+    if use_ntfs && !tool_exists("mkfs.ntfs") {
+        bail!("NTFS mode needs `mkfs.ntfs` — install ntfs-3g + ntfsprogs");
+    }
+
     let device = resolve_target(device_arg, allow_fixed)?;
     if report.total_bytes > device.size {
         bail!(
@@ -537,32 +559,145 @@ fn cmd_create(
         device.size_human(),
         device.display_name()
     );
-    eprintln!("  scheme: {scheme:?}    fs: FAT32    label: {label}");
+    eprintln!(
+        "  scheme: {scheme:?}    fs: {}    label: {label}",
+        if use_ntfs {
+            "NTFS (UEFI:NTFS)"
+        } else {
+            "FAT32"
+        }
+    );
     eprintln!(
         "\n  !! ALL DATA ON {} WILL BE PERMANENTLY DESTROYED. !!",
         device.path
     );
     confirm_destruction(yes, &device.path)?;
 
-    let mut target = usbforge_platform::disk_access()
-        .open(&device, Access::ReadWriteExclusive)
-        .context("failed to open device (need elevated privileges?)")?;
-
     let reporter = CliReporter::new();
-    let stats = reader.install_to_device(&mut *target, scheme, &label, &reporter)?;
-    target.sync()?;
+    let summary = if use_ntfs {
+        create_uefi_ntfs(&device, scheme, &reader, &label, &reporter)?
+    } else {
+        let mut target = usbforge_platform::disk_access()
+            .open(&device, Access::ReadWriteExclusive)
+            .context("failed to open device (need elevated privileges?)")?;
+        let stats = reader.install_to_device(&mut *target, scheme, &label, &reporter)?;
+        target.sync()?;
+        format!(
+            "copied {} files ({})",
+            stats.files,
+            humanize_bytes(stats.bytes)
+        )
+    };
     eprintln!();
 
     println!(
-        "Done — copied {} files ({}). UEFI-bootable: {}.",
-        stats.files,
-        humanize_bytes(stats.bytes),
+        "Done — {summary}. UEFI-bootable: {}.",
         if report.is_uefi_bootable() {
             "yes"
         } else {
             "no (ISO has no UEFI boot files)"
         }
     );
+    Ok(())
+}
+
+/// UEFI:NTFS create (Linux, host-tool assisted): write the two-partition layout
+/// (NTFS main plus a tiny FAT ESP holding the UEFI:NTFS bootloader), run
+/// `mkfs.ntfs` on the main partition, mount it, copy the ISO tree in, unmount.
+fn create_uefi_ntfs(
+    device: &Device,
+    scheme: PartitionScheme,
+    reader: &IsoReader,
+    label: &str,
+    reporter: &CliReporter,
+) -> Result<String> {
+    use usbforge_core::{layout, uefi_ntfs};
+
+    // 1) Partition table + bootloader, written through the whole-disk handle.
+    {
+        let mut target = usbforge_platform::disk_access()
+            .open(device, Access::ReadWriteExclusive)
+            .context("failed to open device (need elevated privileges?)")?;
+        let (main, esp) = layout::write_uefi_ntfs_layout(&mut *target, scheme)?;
+        eprintln!(
+            "Layout: NTFS main {} + UEFI:NTFS ESP {} at offset {}.",
+            humanize_bytes(main.len),
+            humanize_bytes(esp.len),
+            esp.start
+        );
+        uefi_ntfs::write_esp(&mut *target, esp.start)?;
+        target.sync()?;
+        // handle dropped here → releases O_EXCL so the kernel can re-read
+    }
+
+    // 2) Make the kernel pick up the new partition nodes.
+    let _ = std::process::Command::new("partprobe")
+        .arg(&device.path)
+        .status();
+    let _ = std::process::Command::new("udevadm").arg("settle").status();
+
+    let part = partition_path(&device.path, 1);
+    let node = std::path::Path::new(&part);
+    for _ in 0..50 {
+        if node.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if !node.exists() {
+        bail!("partition node {part} did not appear after re-reading the table");
+    }
+
+    // 3) Format the main partition NTFS.
+    eprintln!("Formatting {part} as NTFS …");
+    run_tool("mkfs.ntfs", &["-Q", "-F", "-L", label, &part]).context("mkfs.ntfs failed")?;
+
+    // 4) Mount, copy the ISO tree in, unmount.
+    let mnt = std::env::temp_dir().join(format!("usbforge_ntfs_{}", std::process::id()));
+    std::fs::create_dir_all(&mnt)?;
+    let mnt_str = mnt.to_string_lossy().to_string();
+    run_tool("mount", &["-t", "ntfs-3g", &part, &mnt_str]).context("mounting NTFS failed")?;
+
+    let extract = reader.extract_to_dir(&mnt, reporter);
+
+    let _ = std::process::Command::new("sync").status();
+    let _ = std::process::Command::new("umount").arg(&mnt_str).status();
+    let _ = std::fs::remove_dir_all(&mnt);
+
+    let stats = extract?;
+    Ok(format!(
+        "copied {} files ({}) to NTFS + wrote UEFI:NTFS bootloader",
+        stats.files,
+        humanize_bytes(stats.bytes)
+    ))
+}
+
+/// Is an executable of this name on PATH?
+fn tool_exists(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|p| p.join(name).is_file()))
+        .unwrap_or(false)
+}
+
+/// `/dev/sdb` + 1 → `/dev/sdb1`; `/dev/nvme0n1` + 1 → `/dev/nvme0n1p1`.
+fn partition_path(disk: &str, n: u32) -> String {
+    let needs_p = disk.chars().last().is_some_and(|c| c.is_ascii_digit());
+    if needs_p {
+        format!("{disk}p{n}")
+    } else {
+        format!("{disk}{n}")
+    }
+}
+
+/// Run a host tool and fail if it returns non-zero.
+fn run_tool(cmd: &str, args: &[&str]) -> Result<()> {
+    let status = std::process::Command::new(cmd)
+        .args(args)
+        .status()
+        .with_context(|| format!("could not run `{cmd}`"))?;
+    if !status.success() {
+        bail!("`{cmd}` failed (exit {:?})", status.code());
+    }
     Ok(())
 }
 

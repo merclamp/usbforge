@@ -128,9 +128,16 @@ These surface in the UI as disabled/explained options rather than silent gaps.
   carry a real MBR boot sector; `inspect`/`create` surface it and `write` notes
   it. For such ISOs (Alpine and most Linux distros) a raw `write` boots on BIOS
   *and* UEFI using the ISO's own tested loader — verified on hardware (isolinux
-  MBR + El Torito ESP). _Still TODO: a pure-Rust syslinux/GRUB installer for the
-  file-copy path / non-isohybrid ISOs (needs a FAT extent mapper + boot-record
-  patching; can't be boot-tested in this environment), UEFI:NTFS for >4 GB files._
+  MBR + El Torito ESP).
+  **UEFI:NTFS (done):** `create --fs ntfs|auto` writes a two-partition layout
+  (`layout::write_uefi_ntfs_layout`: NTFS main + a 1 MiB FAT ESP holding the
+  embedded UEFI:NTFS bootloader, `core::uefi_ntfs`), formats the main partition
+  with host `mkfs.ntfs`, mounts it and copies the ISO tree in
+  (`iso::extract_to_dir`). Lets UEFI boot from media whose files exceed FAT32's
+  4 GiB limit (Windows ISOs). Verified on hardware (NTFS main + UEFI:NTFS ESP
+  with x64/aa64/… bootloaders). _Still TODO: a pure-Rust syslinux/GRUB installer
+  for non-isohybrid BIOS boot; UDF reading for real Windows ISOs (cdfs is
+  ISO9660-only); NTFS format/copy currently uses host ntfs-3g (Linux)._
 - **M4 — Windows backend:** SetupAPI enumeration + `DeviceIoControl` disk access
   so the core runs on Windows.
 - **M5 — Windows UX:** WIM apply, TPM/Secure-Boot bypass via `hivex`, unattend,

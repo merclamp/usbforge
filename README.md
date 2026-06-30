@@ -60,6 +60,9 @@ sudo target/release/usbforge format /dev/sdX --scheme gpt --fs fat32 --label MYU
 # Create a UEFI-bootable USB from an ISO (file-copy onto a FAT32 ESP):
 sudo target/release/usbforge create path/to/distro.iso /dev/sdX
 
+# Windows ISO (install.wim > 4 GiB)? Use NTFS + UEFI:NTFS (needs ntfs-3g):
+sudo target/release/usbforge create win.iso /dev/sdX --fs ntfs   # or --fs auto
+
 # For BIOS *and* UEFI boot of an isohybrid ISO (most Linux distros), raw-write it
 # — `inspect` reports "isohybrid: yes" when this applies:
 sudo target/release/usbforge write path/to/distro.iso /dev/sdX

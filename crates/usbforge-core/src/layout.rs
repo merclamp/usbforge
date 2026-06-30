@@ -212,6 +212,129 @@ fn mbr_type_byte(fs: FileSystem) -> u8 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// UEFI:NTFS two-partition layout
+// ---------------------------------------------------------------------------
+
+/// Lay down the Rufus-style **UEFI:NTFS** layout: a large main partition (NTFS,
+/// for the >4 GiB `install.wim`) followed by a tiny FAT EFI System Partition
+/// that holds the UEFI:NTFS bridge bootloader. Returns `(main, esp)` regions.
+pub fn write_uefi_ntfs_layout(
+    target: &mut dyn BlockDevice,
+    scheme: PartitionScheme,
+) -> Result<(PartitionRegion, PartitionRegion)> {
+    match scheme {
+        PartitionScheme::Gpt => gpt_two_part(target),
+        PartitionScheme::Mbr => mbr_two_part(target),
+    }
+}
+
+fn gpt_two_part(target: &mut dyn BlockDevice) -> Result<(PartitionRegion, PartitionRegion)> {
+    use gpt::disk::LogicalBlockSize;
+    use gpt::{partition_types, GptConfig};
+
+    let total = target.size();
+    let total_lba = total / SECTOR;
+    let esp_bytes = crate::uefi_ntfs::ESP_SIZE;
+    let reserve = 2 * ALIGN_BYTES; // alignment + GPT backup headroom
+    let main_len = total.saturating_sub(ALIGN_BYTES + esp_bytes + reserve) & !(ALIGN_BYTES - 1);
+    if main_len < ALIGN_BYTES {
+        return Err(Error::other("device too small for a UEFI:NTFS layout"));
+    }
+
+    let lb = LogicalBlockSize::Lb512;
+    let align = Some(ALIGN_BYTES / SECTOR);
+
+    let (main, esp) = {
+        let mut disk = GptConfig::new()
+            .writable(true)
+            .logical_block_size(lb)
+            .create_from_device(GptDev(&mut *target), None)
+            .map_err(|e| Error::Other(format!("GPT init failed: {e}")))?;
+
+        let main_id = disk
+            .add_partition("Main", main_len, partition_types::BASIC, 0, align)
+            .map_err(|e| Error::Other(format!("GPT add main failed: {e}")))?;
+        let esp_id = disk
+            .add_partition("UEFI_NTFS", esp_bytes, partition_types::EFI, 0, align)
+            .map_err(|e| Error::Other(format!("GPT add ESP failed: {e}")))?;
+
+        let read_region = |id: u32| -> Result<PartitionRegion> {
+            let p = disk
+                .partitions()
+                .get(&id)
+                .ok_or_else(|| Error::other("partition not found"))?;
+            Ok(PartitionRegion {
+                start: p
+                    .bytes_start(lb)
+                    .map_err(|e| Error::Other(format!("region: {e}")))?,
+                len: p
+                    .bytes_len(lb)
+                    .map_err(|e| Error::Other(format!("region: {e}")))?,
+            })
+        };
+        let main = read_region(main_id)?;
+        let esp = read_region(esp_id)?;
+
+        disk.write_inplace()
+            .map_err(|e| Error::Other(format!("GPT write failed: {e}")))?;
+        (main, esp)
+    };
+
+    write_protective_mbr(target, total_lba)?;
+    Ok((main, esp))
+}
+
+fn mbr_two_part(target: &mut dyn BlockDevice) -> Result<(PartitionRegion, PartitionRegion)> {
+    let total = target.size();
+    let total_lba = total / SECTOR;
+    let esp_lba = crate::uefi_ntfs::ESP_SIZE / SECTOR;
+    let align_lba = ALIGN_BYTES / SECTOR;
+    let main_start = align_lba; // 2048
+    let esp_start = total_lba.saturating_sub(align_lba + esp_lba) & !(align_lba - 1);
+    if esp_start <= main_start {
+        return Err(Error::other("device too small for a UEFI:NTFS layout"));
+    }
+    let main_count = esp_start - main_start;
+
+    let mut sector = [0u8; 512];
+    write_mbr_entry(&mut sector, 446, 0x07, main_start, main_count); // NTFS
+    write_mbr_entry(&mut sector, 462, 0xEF, esp_start, esp_lba); // ESP
+    sector[510] = 0x55;
+    sector[511] = 0xAA;
+    target.seek(SeekFrom::Start(0))?;
+    target.write_all(&sector)?;
+
+    Ok((
+        PartitionRegion {
+            start: main_start * SECTOR,
+            len: main_count * SECTOR,
+        },
+        PartitionRegion {
+            start: esp_start * SECTOR,
+            len: esp_lba * SECTOR,
+        },
+    ))
+}
+
+/// Fill a 16-byte MBR partition entry at `off` (LBA addressing, CHS placeholders).
+fn write_mbr_entry(
+    sector: &mut [u8; 512],
+    off: usize,
+    type_byte: u8,
+    start_lba: u64,
+    count_lba: u64,
+) {
+    let start = u32::try_from(start_lba).unwrap_or(u32::MAX);
+    let count = u32::try_from(count_lba.min(u32::MAX as u64)).unwrap_or(u32::MAX);
+    sector[off] = 0x00; // not active
+    sector[off + 1..off + 4].copy_from_slice(&[0xFE, 0xFF, 0xFF]);
+    sector[off + 4] = type_byte;
+    sector[off + 5..off + 8].copy_from_slice(&[0xFE, 0xFF, 0xFF]);
+    sector[off + 8..off + 12].copy_from_slice(&start.to_le_bytes());
+    sector[off + 12..off + 16].copy_from_slice(&count.to_le_bytes());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,6 +370,29 @@ mod tests {
             .open_from_device(GptDev(&mut dev))
             .unwrap();
         assert_eq!(disk.partitions().len(), 1);
+    }
+
+    #[test]
+    fn uefi_ntfs_two_partition_gpt() {
+        let mut dev = MemDevice::new(256 * 1024 * 1024);
+        let (main, esp) = write_uefi_ntfs_layout(&mut dev, PartitionScheme::Gpt).unwrap();
+
+        assert!(main.start >= ALIGN_BYTES);
+        assert_eq!(esp.len, crate::uefi_ntfs::ESP_SIZE);
+        assert!(main.len > esp.len);
+        // The two partitions must not overlap.
+        assert!(main.start + main.len <= esp.start);
+        // Protective MBR present.
+        assert_eq!(dev.data()[446 + 4], 0xEE);
+
+        use gpt::disk::LogicalBlockSize;
+        use gpt::GptConfig;
+        let disk = GptConfig::new()
+            .writable(false)
+            .logical_block_size(LogicalBlockSize::Lb512)
+            .open_from_device(GptDev(&mut dev))
+            .unwrap();
+        assert_eq!(disk.partitions().len(), 2);
     }
 
     #[test]

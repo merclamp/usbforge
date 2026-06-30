@@ -141,6 +141,21 @@ impl IsoReader {
         Ok(stats)
     }
 
+    /// Extract the whole ISO tree into an existing directory on a mounted
+    /// filesystem (used for the UEFI:NTFS path, where the target NTFS volume is
+    /// mounted by the OS and we copy into it).
+    pub fn extract_to_dir(&self, dir: &Path, reporter: &dyn Reporter) -> Result<ExtractStats> {
+        let (_, total) = dir_totals(self.iso.root());
+        reporter.info(&format!(
+            "Extracting {} to the mounted volume …",
+            crate::device::humanize_bytes(total)
+        ));
+        let mut stats = ExtractStats::default();
+        copy_dir_to_fs(self.iso.root(), dir, total, &mut stats, reporter)?;
+        reporter.progress("extract", 1.0);
+        Ok(stats)
+    }
+
     fn exists(&self, path: &str) -> bool {
         matches!(self.iso.open(path), Ok(Some(_)))
     }
@@ -233,6 +248,44 @@ fn copy_dir<W: ReadWriteSeek>(
                 }
             }
             // Symlinks aren't representable on FAT; skip them.
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Recursively copy a cdfs directory into a real filesystem directory.
+fn copy_dir_to_fs(
+    src: &ISODirectory<File>,
+    dst: &Path,
+    total: u64,
+    stats: &mut ExtractStats,
+    reporter: &dyn Reporter,
+) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in src.contents() {
+        let entry = entry.map_err(|e| Error::Image(format!("ISO read error: {e}")))?;
+        let name = clean_name(entry.identifier());
+        if is_special(&name) {
+            continue;
+        }
+        let path = dst.join(&name);
+        match entry {
+            DirectoryEntry::Directory(dir) => {
+                copy_dir_to_fs(&dir, &path, total, stats, reporter)?;
+            }
+            DirectoryEntry::File(file) => {
+                let mut writer = std::fs::File::create(&path)
+                    .map_err(|e| Error::Other(format!("creating {name:?}: {e}")))?;
+                let mut reader = file.read();
+                std::io::copy(&mut reader, &mut writer)
+                    .map_err(|e| Error::Other(format!("copying {name:?}: {e}")))?;
+                stats.files += 1;
+                stats.bytes += u64::from(file.size());
+                if total > 0 {
+                    reporter.progress("extract", stats.bytes as f32 / total as f32);
+                }
+            }
             _ => {}
         }
     }

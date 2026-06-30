@@ -104,8 +104,12 @@ These surface in the UI as disabled/explained options rather than silent gaps.
 
 - **M0 — Scaffold (done):** workspace, core traits, Linux sysfs enumeration,
   hashing, CLI `list`/`hash`/`inspect`.
-- **M1 — Write path (PoC):** open device (`DiskAccess`), raw image write
-  (dd-style) with progress + sync + verify; safety guards (refuse system disk).
+- **M1 — Write path (done, PoC):** raw image write (dd-style) with progress +
+  flush/sync + read-back verify (`core::write`); device open via `O_EXCL`
+  (`platform::linux::block`); CLI `write` with safety guards (device must be
+  enumerated; refuse fixed/system disk without `--allow-fixed`, refuse
+  write-protected, size check, typed confirmation). _Still TODO: `O_DIRECT` +
+  aligned I/O for throughput, `BLKRRPART`/volume locking, compressed sources._
 - **M2 — Partitioning + format:** GPT/MBR via `gpt`/`mbrman`; FAT32/exFAT/ext4.
 - **M3 — Bootloaders + ISO:** ISO9660 extract; ms-sys boot records; syslinux,
   GRUB, UEFI:NTFS.

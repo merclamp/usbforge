@@ -5,10 +5,11 @@ writing disk images — a clean-room **Rust** reimagining of
 [Rufus](https://github.com/pbatard/rufus), carrying over its feature set onto a
 portable, memory-safe codebase.
 
-> Status: **early scaffold.** The workspace builds and the CLI can enumerate
-> removable devices and verify image checksums. The write path, formatting,
-> bootloaders, and GUI are under construction — see
-> [`ARCHITECTURE.md`](ARCHITECTURE.md) for the design and roadmap.
+> Status: **early, but it writes.** The workspace builds; the CLI enumerates
+> removable devices, verifies checksums, and writes raw images (`.iso`/`.img`/
+> `.raw`) to a device dd-style with progress, flush, and read-back verification —
+> guarded so it refuses fixed/system disks. Formatting, bootloaders, the Windows
+> backend, and the GUI are next — see [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Why a rewrite (not a port)
 
@@ -36,10 +37,16 @@ cargo run -p usbforge-cli -- list           # removable devices only
 cargo run -p usbforge-cli -- list --all     # include fixed disks
 cargo run -p usbforge-cli -- hash path/to/image.iso
 cargo run -p usbforge-cli -- inspect path/to/image.iso
+
+# Write a raw image to a device (DESTRUCTIVE). Needs root; prompts for
+# confirmation unless --yes. Refuses fixed/system disks unless --allow-fixed.
+sudo target/release/usbforge write path/to/image.iso /dev/sdX
+
 cargo test
 ```
 
-Listing reads `/sys/block`; no root needed. Writing to a device (later) will.
+Listing reads `/sys/block`; no root needed. `write` opens the device with
+`O_EXCL` (fails if a partition is mounted) and needs elevated privileges.
 
 ## License
 

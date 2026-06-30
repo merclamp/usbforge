@@ -5,14 +5,18 @@
 //! `hash`/`inspect` exercise the image + hashing modules — all without any GUI.
 
 use std::collections::BTreeMap;
+use std::io::{IsTerminal, Write as _};
+use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 
-use usbforge_core::device::Device;
+use usbforge_core::device::{humanize_bytes, Device};
+use usbforge_core::disk::Access;
 use usbforge_core::hash::{self, Algo};
-use usbforge_core::image::ImageInfo;
+use usbforge_core::image::{ImageInfo, ImageKind};
 use usbforge_core::report::{Level, Reporter};
+use usbforge_core::write::{self, WriteOptions};
 use usbforge_core::PRODUCT;
 
 #[derive(Parser)]
@@ -43,6 +47,22 @@ enum Command {
         #[arg(long, value_delimiter = ',')]
         algo: Vec<String>,
     },
+    /// Write a raw image (.iso/.img/.raw) to a device. DESTROYS all data on it.
+    Write {
+        /// Source image file.
+        image: String,
+        /// Target device path or id (e.g. /dev/sdb or sdb). See `list --all`.
+        device: String,
+        /// Skip the interactive confirmation prompt (required for scripts).
+        #[arg(long)]
+        yes: bool,
+        /// Permit writing to a non-removable (fixed/internal) disk.
+        #[arg(long)]
+        allow_fixed: bool,
+        /// Skip the read-back verification pass.
+        #[arg(long)]
+        no_verify: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -51,6 +71,13 @@ fn main() -> Result<()> {
         Command::List { all } => cmd_list(all),
         Command::Inspect { path } => cmd_inspect(&path),
         Command::Hash { path, algo } => cmd_hash(&path, &algo),
+        Command::Write {
+            image,
+            device,
+            yes,
+            allow_fixed,
+            no_verify,
+        } => cmd_write(&image, &device, yes, allow_fixed, no_verify),
     }
 }
 
@@ -139,6 +166,110 @@ fn print_digests(digests: &BTreeMap<Algo, String>) {
     for (algo, digest) in digests {
         println!("{:<8} {}", algo.name(), digest);
     }
+}
+
+fn cmd_write(
+    image: &str,
+    device_arg: &str,
+    yes: bool,
+    allow_fixed: bool,
+    no_verify: bool,
+) -> Result<()> {
+    let info = ImageInfo::inspect(image).context("failed to inspect image")?;
+    if matches!(info.kind, ImageKind::CompressedDisk) {
+        bail!("compressed images are not supported yet (planned for M3) — decompress it first");
+    }
+
+    // Resolve the target against the enumerated device list so we know its
+    // metadata (removable / size / write-protect) *before* touching it.
+    let devices = usbforge_platform::device_enumerator()
+        .list(false)
+        .context("failed to enumerate devices")?;
+    let device = devices
+        .iter()
+        .find(|d| d.path == device_arg || d.id == device_arg)
+        .ok_or_else(|| {
+            anyhow!(
+                "device '{device_arg}' not found; run `usbforge list --all` to see ids/paths"
+            )
+        })?;
+
+    // ---- safety guards ----------------------------------------------------
+    if device.read_only {
+        bail!("{} is write-protected", device.path);
+    }
+    if !device.is_removable_media() && !allow_fixed {
+        bail!(
+            "{} looks like a fixed/internal disk ({}) — refusing.\n\
+             Re-run with --allow-fixed only if you are absolutely certain.",
+            device.path,
+            device.display_name()
+        );
+    }
+    if info.size > device.size {
+        bail!(
+            "image ({}) is larger than device {} ({})",
+            humanize_bytes(info.size),
+            device.path,
+            device.size_human()
+        );
+    }
+
+    // ---- destructive-action confirmation ----------------------------------
+    eprintln!("\nAbout to write:");
+    eprintln!(
+        "  image:  {image}  ({}, {})",
+        info.kind.label(),
+        humanize_bytes(info.size)
+    );
+    eprintln!(
+        "  target: {}  [{}]  {}  {}",
+        device.path,
+        device.bus,
+        device.size_human(),
+        device.display_name()
+    );
+    eprintln!(
+        "\n  !! ALL DATA ON {} WILL BE PERMANENTLY DESTROYED. !!",
+        device.path
+    );
+
+    if !yes {
+        if !std::io::stdin().is_terminal() {
+            bail!("refusing to write without confirmation (re-run with --yes for non-interactive use)");
+        }
+        print!("\nType the device path ({}) to confirm: ", device.path);
+        std::io::stdout().flush().ok();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        if line.trim() != device.path {
+            bail!("confirmation did not match; aborted");
+        }
+    }
+
+    // ---- write ------------------------------------------------------------
+    let mut target = usbforge_platform::disk_access()
+        .open(device, Access::ReadWriteExclusive)
+        .context("failed to open device for writing (need elevated privileges?)")?;
+
+    let reporter = CliReporter::new();
+    let summary = write::write_image_file(
+        Path::new(image),
+        &mut *target,
+        &WriteOptions {
+            verify: !no_verify,
+            ..Default::default()
+        },
+        &reporter,
+    )?;
+    eprintln!();
+
+    println!(
+        "Done — wrote {}{}.",
+        humanize_bytes(summary.bytes_written),
+        if summary.verified { " (verified)" } else { "" }
+    );
+    Ok(())
 }
 
 /// Minimal reporter: logs to stderr, progress as an in-place percentage.

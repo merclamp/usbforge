@@ -23,6 +23,7 @@ pub mod filesystem;
 pub mod hash;
 pub mod image;
 pub mod report;
+pub mod write;
 
 pub use error::{Error, Result};
 pub use report::{Level, NullReporter, Reporter};

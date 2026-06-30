@@ -81,12 +81,14 @@ cross-platform (Linux + Windows) application.
 - **Crypto/signatures:** `rsa` + `sha2`, or `openssl`.
 - **CLI:** `clap` (in use). **Errors:** `thiserror` (lib), `anyhow` (bin).
 
-### GUI toolkit (to confirm)
+### GUI toolkit — **Slint (chosen)**
 
-Candidates, all Rust-native and cross-platform: **Slint** (declarative, closest
-to Rufus's form layout, GPLv3-compatible), **iced** (Elm-style), **egui**
-(immediate-mode, simplest). Leaning Slint. The GUI is an isolated crate driving
-the same core traits, so the choice is low-risk and swappable.
+Slint (declarative `.slint` UI compiled by `slint-build`, GPLv3-compatible) is
+the closest Rust-native toolkit to Rufus's form layout. The `usbforge-gui` crate
+drives the same core traits the CLI uses; long operations run on a worker thread
+and report progress/log to the UI via `slint::invoke_from_event_loop`. Native
+file picker via `rfd`. A working window (device dropdown, write/format/create,
+progress + log) exists and renders on Wayland/X11.
 
 ## 5. Feature parity & hard blockers
 
@@ -133,6 +135,10 @@ These surface in the UI as disabled/explained options rather than silent gaps.
   so the core runs on Windows.
 - **M5 — Windows UX:** WIM apply, TPM/Secure-Boot bypass via `hivex`, unattend,
   persistence; Fido download; signature checks.
-- **M6 — GUI:** device picker, source picker, progress, dark mode, i18n.
+- **M6 — GUI (v1 done):** Slint window — device dropdown + refresh, image
+  picker (`rfd`), write/format/create modes, scheme/label fields, erase
+  confirmation, progress bar + log; worker-thread execution with a `GuiReporter`.
+  Verified rendering on Wayland with a real device listed. _TODO: in-GUI
+  privilege elevation (pkexec/UAC), dark mode polish, i18n, cancel button._
 - **M7 — Packaging:** deb/rpm/AppImage/Flatpak (Linux), MSI/portable (Windows);
   CI matrix.

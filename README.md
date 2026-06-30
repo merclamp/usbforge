@@ -27,7 +27,7 @@ reporting seams instead of global `uprintf()` / `SendMessage` glue.
 | `usbforge-core` | Platform-agnostic domain model, traits (HAL), hashing, reporting. No OS or GUI code. |
 | `usbforge-platform` | Per-OS backends behind the core traits (Linux: sysfs/ioctl; Windows: SetupAPI/DeviceIoControl). |
 | `usbforge-cli` | Headless frontend + proof-of-concept (`usbforge` binary). |
-| `usbforge-gui` | Graphical frontend (placeholder for now). |
+| `usbforge-gui` | Slint GUI: device picker, write/format/create, live progress + log. |
 
 ## Contributing (two-person, cross-platform)
 
@@ -66,6 +66,19 @@ sudo target/release/usbforge write path/to/distro.iso /dev/sdX
 
 cargo test
 ```
+
+### GUI
+
+A Slint desktop GUI wraps the same engine (device dropdown, image picker,
+write/format/create modes, progress bar + log):
+
+```sh
+cargo run -p usbforge-gui          # enumerate works as a user;
+pkexec target/debug/usbforge-gui   # …run elevated to write to devices
+```
+
+Linux build needs `libgtk-3-dev libxkbcommon-dev libfontconfig1-dev` (and a
+Wayland/X11 session at runtime).
 
 Listing reads `/sys/block`; no root needed. `write` opens the device with
 `O_EXCL` (fails if a partition is mounted) and needs elevated privileges.

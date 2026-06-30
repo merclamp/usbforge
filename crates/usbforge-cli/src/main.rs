@@ -13,8 +13,11 @@ use clap::{Parser, Subcommand};
 
 use usbforge_core::device::{humanize_bytes, Device};
 use usbforge_core::disk::Access;
+use usbforge_core::filesystem::{FileSystem, PartitionScheme};
+use usbforge_core::format::{self, PartitionSlice};
 use usbforge_core::hash::{self, Algo};
 use usbforge_core::image::{ImageInfo, ImageKind};
+use usbforge_core::layout;
 use usbforge_core::report::{Level, Reporter};
 use usbforge_core::write::{self, WriteOptions};
 use usbforge_core::PRODUCT;
@@ -67,6 +70,54 @@ enum Command {
         #[arg(long)]
         no_verify: bool,
     },
+    /// Partition + format a device (DESTROYS all data on it).
+    Format {
+        /// Target device path or id (e.g. /dev/sdb or sdb). See `list --all`.
+        device: String,
+        /// Partition scheme.
+        #[arg(long, value_enum, default_value = "gpt")]
+        scheme: SchemeArg,
+        /// Filesystem to create.
+        #[arg(long, value_enum, default_value = "fat32")]
+        fs: FsArg,
+        /// Volume label (default: USBFORGE).
+        #[arg(long)]
+        label: Option<String>,
+        /// Skip the interactive confirmation prompt (required for scripts).
+        #[arg(long)]
+        yes: bool,
+        /// Permit formatting a non-removable (fixed/internal) disk.
+        #[arg(long)]
+        allow_fixed: bool,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum SchemeArg {
+    Gpt,
+    Mbr,
+}
+
+impl From<SchemeArg> for PartitionScheme {
+    fn from(s: SchemeArg) -> Self {
+        match s {
+            SchemeArg::Gpt => PartitionScheme::Gpt,
+            SchemeArg::Mbr => PartitionScheme::Mbr,
+        }
+    }
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum FsArg {
+    Fat32,
+}
+
+impl From<FsArg> for FileSystem {
+    fn from(f: FsArg) -> Self {
+        match f {
+            FsArg::Fat32 => FileSystem::Fat32,
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -82,6 +133,14 @@ fn main() -> Result<()> {
             allow_fixed,
             no_verify,
         } => cmd_write(&image, &device, yes, allow_fixed, no_verify),
+        Command::Format {
+            device,
+            scheme,
+            fs,
+            label,
+            yes,
+            allow_fixed,
+        } => cmd_format(&device, scheme, fs, label, yes, allow_fixed),
     }
 }
 
@@ -184,30 +243,7 @@ fn cmd_write(
         bail!("compressed images are not supported yet (planned for M3) — decompress it first");
     }
 
-    // Resolve the target against the enumerated device list so we know its
-    // metadata (removable / size / write-protect) *before* touching it.
-    let devices = usbforge_platform::device_enumerator()
-        .list(false)
-        .context("failed to enumerate devices")?;
-    let device = devices
-        .iter()
-        .find(|d| d.path == device_arg || d.id == device_arg)
-        .ok_or_else(|| {
-            anyhow!("device '{device_arg}' not found; run `usbforge list --all` to see ids/paths")
-        })?;
-
-    // ---- safety guards ----------------------------------------------------
-    if device.read_only {
-        bail!("{} is write-protected", device.path);
-    }
-    if !device.is_removable_media() && !allow_fixed {
-        bail!(
-            "{} looks like a fixed/internal disk ({}) — refusing.\n\
-             Re-run with --allow-fixed only if you are absolutely certain.",
-            device.path,
-            device.display_name()
-        );
-    }
+    let device = resolve_target(device_arg, allow_fixed)?;
     if info.size > device.size {
         bail!(
             "image ({}) is larger than device {} ({})",
@@ -217,7 +253,6 @@ fn cmd_write(
         );
     }
 
-    // ---- destructive-action confirmation ----------------------------------
     eprintln!("\nAbout to write:");
     eprintln!(
         "  image:  {image}  ({}, {})",
@@ -235,23 +270,11 @@ fn cmd_write(
         "\n  !! ALL DATA ON {} WILL BE PERMANENTLY DESTROYED. !!",
         device.path
     );
-
-    if !yes {
-        if !std::io::stdin().is_terminal() {
-            bail!("refusing to write without confirmation (re-run with --yes for non-interactive use)");
-        }
-        print!("\nType the device path ({}) to confirm: ", device.path);
-        std::io::stdout().flush().ok();
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line)?;
-        if line.trim() != device.path {
-            bail!("confirmation did not match; aborted");
-        }
-    }
+    confirm_destruction(yes, &device.path)?;
 
     // ---- write ------------------------------------------------------------
     let mut target = usbforge_platform::disk_access()
-        .open(device, Access::ReadWriteExclusive)
+        .open(&device, Access::ReadWriteExclusive)
         .context("failed to open device for writing (need elevated privileges?)")?;
 
     let reporter = CliReporter::new();
@@ -270,6 +293,107 @@ fn cmd_write(
         "Done — wrote {}{}.",
         humanize_bytes(summary.bytes_written),
         if summary.verified { " (verified)" } else { "" }
+    );
+    Ok(())
+}
+
+/// Resolve a device by path/id and apply the "is this safe to clobber?" guards.
+/// Returns an owned [`Device`] so callers hold no borrow on the device list.
+fn resolve_target(device_arg: &str, allow_fixed: bool) -> Result<Device> {
+    let device = usbforge_platform::device_enumerator()
+        .list(false)
+        .context("failed to enumerate devices")?
+        .into_iter()
+        .find(|d| d.path == device_arg || d.id == device_arg)
+        .ok_or_else(|| {
+            anyhow!("device '{device_arg}' not found; run `usbforge list --all` to see ids/paths")
+        })?;
+
+    if device.read_only {
+        bail!("{} is write-protected", device.path);
+    }
+    if !device.is_removable_media() && !allow_fixed {
+        bail!(
+            "{} looks like a fixed/internal disk ({}) — refusing.\n\
+             Re-run with --allow-fixed only if you are absolutely certain.",
+            device.path,
+            device.display_name()
+        );
+    }
+    Ok(device)
+}
+
+/// Typed-path confirmation gate for a destructive operation.
+fn confirm_destruction(yes: bool, device_path: &str) -> Result<()> {
+    if yes {
+        return Ok(());
+    }
+    if !std::io::stdin().is_terminal() {
+        bail!("refusing without confirmation (re-run with --yes for non-interactive use)");
+    }
+    print!("\nType the device path ({device_path}) to confirm: ");
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    if line.trim() != device_path {
+        bail!("confirmation did not match; aborted");
+    }
+    Ok(())
+}
+
+fn cmd_format(
+    device_arg: &str,
+    scheme: SchemeArg,
+    fs: FsArg,
+    label: Option<String>,
+    yes: bool,
+    allow_fixed: bool,
+) -> Result<()> {
+    let device = resolve_target(device_arg, allow_fixed)?;
+    let scheme: PartitionScheme = scheme.into();
+    let fs_kind: FileSystem = fs.into();
+    let label = label.unwrap_or_else(|| "USBFORGE".to_string());
+
+    eprintln!("\nAbout to PARTITION + FORMAT:");
+    eprintln!(
+        "  target: {}  [{}]  {}  {}",
+        device.path,
+        device.bus,
+        device.size_human(),
+        device.display_name()
+    );
+    eprintln!("  scheme: {scheme:?}    fs: {fs_kind}    label: {label}");
+    eprintln!(
+        "\n  !! ALL DATA ON {} WILL BE PERMANENTLY DESTROYED. !!",
+        device.path
+    );
+    confirm_destruction(yes, &device.path)?;
+
+    let mut target = usbforge_platform::disk_access()
+        .open(&device, Access::ReadWriteExclusive)
+        .context("failed to open device (need elevated privileges?)")?;
+
+    let region = layout::write_single_partition(&mut *target, scheme, fs_kind, &label)?;
+    eprintln!(
+        "Partition table written ({scheme:?}); data partition at offset {} ({}).",
+        region.start,
+        humanize_bytes(region.len)
+    );
+
+    match fs_kind {
+        FileSystem::Fat32 => {
+            let mut slice = PartitionSlice::new(&mut *target, region.start, region.len);
+            format::format_fat32(&mut slice, &label)?;
+        }
+        other => bail!(
+            "formatting {other} is not implemented yet (M2 covers FAT32; exFAT/ext4/NTFS next)"
+        ),
+    }
+
+    target.sync()?;
+    println!(
+        "Done — {} formatted as {fs_kind} ({scheme:?}).",
+        device.path
     );
     Ok(())
 }

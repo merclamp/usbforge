@@ -20,10 +20,15 @@ pub mod device;
 pub mod disk;
 pub mod error;
 pub mod filesystem;
+pub mod format;
 pub mod hash;
 pub mod image;
+pub mod layout;
 pub mod report;
 pub mod write;
+
+#[cfg(test)]
+mod testutil;
 
 pub use error::{Error, Result};
 pub use report::{Level, NullReporter, Reporter};

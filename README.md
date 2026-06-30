@@ -72,16 +72,19 @@ cargo test
 
 ### GUI
 
-A Slint desktop GUI wraps the same engine (device dropdown, image picker,
-write/format/create modes, progress bar + log):
+A Slint desktop GUI wraps the same engine — device dropdown, image picker,
+write/format/create modes (with a FAT32/NTFS/auto selector), progress bar + log:
 
 ```sh
-cargo run -p usbforge-gui          # enumerate works as a user;
-pkexec target/debug/usbforge-gui   # …run elevated to write to devices
+cargo run -p usbforge-gui          # run as a normal user
 ```
 
+Device enumeration runs in-process; the destructive operation is delegated to
+the `usbforge` CLI via **pkexec**, so PolicyKit shows a native password prompt
+and the work runs as root — the GUI itself never needs elevation.
+
 Linux build needs `libgtk-3-dev libxkbcommon-dev libfontconfig1-dev` (and a
-Wayland/X11 session at runtime).
+Wayland/X11 session + a running PolicyKit agent at runtime).
 
 Listing reads `/sys/block`; no root needed. `write` opens the device with
 `O_EXCL` (fails if a partition is mounted) and needs elevated privileges.

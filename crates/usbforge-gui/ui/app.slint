@@ -19,8 +19,9 @@ export component AppWindow inherits Window {
 
     // --- two-way state (edited in the UI) ---
     in-out property <int> device-index: 0;
-    in-out property <int> mode-index: 0;     // 0 create, 1 write, 2 format
-    in-out property <int> scheme-index: 0;   // 0 gpt, 1 mbr
+    in-out property <int> mode-index: 0;       // 0 create, 1 write, 2 format
+    in-out property <int> scheme-index: 0;     // 0 gpt, 1 mbr
+    in-out property <int> create-fs-index: 0;  // 0 auto, 1 fat32, 2 ntfs
     in-out property <string> image-path;
     in-out property <string> volume-label: "USBFORGE";
     in-out property <bool> confirm-erase: false;
@@ -94,6 +95,16 @@ export component AppWindow inherits Window {
                         model: ["GPT", "MBR"];
                         current-index <=> scheme-index;
                         enabled: !busy;
+                    }
+                }
+                if (mode-index == 0) : HorizontalBox {
+                    spacing: 8px;
+                    Text { text: "Filesystem:"; vertical-alignment: center; }
+                    ComboBox {
+                        model: ["Auto (NTFS for Windows ISO, else FAT32)", "FAT32", "NTFS (UEFI:NTFS)"];
+                        current-index <=> create-fs-index;
+                        enabled: !busy;
+                        horizontal-stretch: 1;
                     }
                 }
             }

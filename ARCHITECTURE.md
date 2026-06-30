@@ -149,10 +149,13 @@ These surface in the UI as disabled/explained options rather than silent gaps.
   so the core runs on Windows.
 - **M5 — Windows UX:** WIM apply, TPM/Secure-Boot bypass via `hivex`, unattend,
   persistence; Fido download; signature checks.
-- **M6 — GUI (v1 done):** Slint window — device dropdown + refresh, image
-  picker (`rfd`), write/format/create modes, scheme/label fields, erase
-  confirmation, progress bar + log; worker-thread execution with a `GuiReporter`.
-  Verified rendering on Wayland with a real device listed. _TODO: in-GUI
-  privilege elevation (pkexec/UAC), dark mode polish, i18n, cancel button._
+- **M6 — GUI (done):** Slint window — device dropdown + refresh, image picker
+  (`rfd`), create/write/format modes with a FAT32/NTFS/auto selector,
+  scheme/label fields, erase confirmation, progress bar + log. Enumeration runs
+  in-process; the destructive op is delegated to the `usbforge` CLI via
+  **pkexec** (native PolicyKit prompt; the GUI never runs as root), and the CLI's
+  stderr is parsed back into the progress bar + log. Verified rendering on
+  Wayland with a real device + the NTFS selector. _TODO: dark mode polish, i18n,
+  cancel button, Windows UAC elevation path._
 - **M7 — Packaging:** deb/rpm/AppImage/Flatpak (Linux), MSI/portable (Windows);
   CI matrix.

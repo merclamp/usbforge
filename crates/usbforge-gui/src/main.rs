@@ -1,39 +1,30 @@
 //! USBForge graphical frontend (Slint).
 //!
-//! A thin view over the same `usbforge-core` engine the CLI drives. Device
-//! enumeration and image selection happen on the UI thread; the actual
-//! write/format/create runs on a worker thread and reports progress + log lines
-//! back to the UI via [`GuiReporter`] (marshalled onto the event loop).
-//!
-//! Hide the console window on Windows for release builds.
+//! Device enumeration runs in-process (no privileges needed). The destructive
+//! operations are delegated to the `usbforge` CLI, launched via **pkexec** so
+//! PolicyKit shows a native auth dialog and the work runs as root — the GUI
+//! itself never needs to be root. The CLI's progress/log (on stderr) is streamed
+//! back into the window.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use std::cell::RefCell;
+use std::io::Read;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::Arc;
 
 use slint::{ModelRc, SharedString, VecModel};
 
-use usbforge_core::device::{humanize_bytes, Device};
-use usbforge_core::disk::Access;
-use usbforge_core::filesystem::{FileSystem, PartitionScheme};
-use usbforge_core::format::{self, PartitionSlice};
-use usbforge_core::iso::IsoReader;
-use usbforge_core::layout;
-use usbforge_core::report::{Level, Reporter};
-use usbforge_core::write::{self, WriteOptions};
+use usbforge_core::device::Device;
 
 slint::include_modules!();
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = AppWindow::new()?;
 
-    // The enumerated devices, mapped 1:1 to the dropdown entries.
     let devices: Rc<RefCell<Vec<Device>>> = Rc::new(RefCell::new(Vec::new()));
     refresh_devices(&app, &devices);
 
-    // Refresh button.
     {
         let weak = app.as_weak();
         let devices = devices.clone();
@@ -44,7 +35,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Browse button — native file dialog via rfd.
     {
         let weak = app.as_weak();
         app.on_browse(move || {
@@ -65,7 +55,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // START — validate, then run the operation on a worker thread.
     {
         let weak = app.as_weak();
         let devices = devices.clone();
@@ -80,7 +69,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .then(|| devices.borrow().get(idx as usize).cloned())
                 .flatten()
             {
-                Some(dev) => dev,
+                Some(d) => d,
                 None => {
                     app.set_status("Select a device first.".into());
                     return;
@@ -88,57 +77,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             let mode = app.get_mode_index();
-            let scheme = if app.get_scheme_index() == 0 {
-                PartitionScheme::Gpt
-            } else {
-                PartitionScheme::Mbr
-            };
             let image = app.get_image_path().to_string();
-            let label = {
-                let l = app.get_volume_label().to_string();
-                if l.trim().is_empty() {
-                    "USBFORGE".to_string()
-                } else {
-                    l
-                }
-            };
-
-            if device.read_only {
-                app.set_status(format!("{} is write-protected.", device.path).into());
-                return;
-            }
             if (mode == 0 || mode == 1) && image.trim().is_empty() {
                 app.set_status("Choose an image file first.".into());
                 return;
             }
 
+            let args = build_cli_args(
+                mode,
+                app.get_scheme_index(),
+                app.get_create_fs_index(),
+                &image,
+                &device.path,
+                {
+                    let l = app.get_volume_label().to_string();
+                    if l.trim().is_empty() {
+                        "USBFORGE".to_string()
+                    } else {
+                        l
+                    }
+                },
+            );
+
             app.set_busy(true);
             app.set_progress(0.0);
             app.set_progress_text("0%".into());
             app.set_log(SharedString::from(""));
-            app.set_status(format!("Working on {} …", device.path).into());
+            app.set_status(format!("Authorising and working on {} …", device.path).into());
 
-            let reporter = Arc::new(GuiReporter {
-                weak: weak.clone(),
-                last_pct: AtomicI32::new(-1),
-            });
-            let done = weak.clone();
-            std::thread::spawn(move || {
-                let result =
-                    run_operation(mode, &device, scheme, &image, &label, reporter.as_ref());
-                let (ok, msg) = match result {
-                    Ok(s) => (true, format!("✓ {s}")),
-                    Err(e) => (false, format!("✗ {e}")),
-                };
-                let _ = done.upgrade_in_event_loop(move |app| {
-                    app.set_busy(false);
-                    app.set_status(msg.into());
-                    if ok {
-                        app.set_progress(1.0);
-                        app.set_progress_text("100%".into());
-                    }
-                });
-            });
+            let weak = weak.clone();
+            std::thread::spawn(move || run_privileged(args, weak));
         });
     }
 
@@ -172,98 +140,201 @@ fn refresh_devices(app: &AppWindow, store: &Rc<RefCell<Vec<Device>>>) {
     *store.borrow_mut() = list;
 }
 
-/// Run the selected operation. Called on a worker thread.
-fn run_operation(
+/// Build the `usbforge` CLI argument vector for the selected operation.
+fn build_cli_args(
     mode: i32,
-    device: &Device,
-    scheme: PartitionScheme,
+    scheme_index: i32,
+    create_fs_index: i32,
     image: &str,
-    label: &str,
-    reporter: &dyn Reporter,
-) -> usbforge_core::Result<String> {
-    let access = usbforge_platform::disk_access();
+    device_path: &str,
+    label: String,
+) -> Vec<String> {
+    let scheme = if scheme_index == 0 { "gpt" } else { "mbr" };
     match mode {
         0 => {
-            // Create bootable USB from ISO (file-copy → FAT32 ESP).
-            let reader = IsoReader::open(image)?;
-            let mut target = access.open(device, Access::ReadWriteExclusive)?;
-            let stats = reader.install_to_device(&mut *target, scheme, label, reporter)?;
-            target.sync()?;
-            Ok(format!(
-                "Created bootable USB — {} files ({}).",
-                stats.files,
-                humanize_bytes(stats.bytes)
-            ))
-        }
-        1 => {
-            // Raw (dd-style) write with verification.
-            let mut target = access.open(device, Access::ReadWriteExclusive)?;
-            let summary = write::write_image_file(
-                std::path::Path::new(image),
-                &mut *target,
-                &WriteOptions::default(),
-                reporter,
-            )?;
-            target.sync()?;
-            Ok(format!(
-                "Wrote {}{}.",
-                humanize_bytes(summary.bytes_written),
-                if summary.verified { " (verified)" } else { "" }
-            ))
-        }
-        _ => {
-            // Format only (GPT/MBR + FAT32).
-            let mut target = access.open(device, Access::ReadWriteExclusive)?;
-            let region = layout::write_single_partition(
-                &mut *target,
-                scheme,
-                FileSystem::Fat32,
+            let fs = match create_fs_index {
+                1 => "fat32",
+                2 => "ntfs",
+                _ => "auto",
+            };
+            vec![
+                "create".into(),
+                image.into(),
+                device_path.into(),
+                "--scheme".into(),
+                scheme.into(),
+                "--fs".into(),
+                fs.into(),
+                "--label".into(),
                 label,
-                false,
-            )?;
-            {
-                let mut slice = PartitionSlice::new(&mut *target, region.start, region.len);
-                format::format_fat32(&mut slice, label)?;
-            }
-            target.sync()?;
-            Ok("Formatted as FAT32.".into())
+                "--yes".into(),
+            ]
         }
+        1 => vec![
+            "write".into(),
+            image.into(),
+            device_path.into(),
+            "--yes".into(),
+        ],
+        _ => vec![
+            "format".into(),
+            device_path.into(),
+            "--scheme".into(),
+            scheme.into(),
+            "--fs".into(),
+            "fat32".into(),
+            "--label".into(),
+            label,
+            "--yes".into(),
+        ],
     }
 }
 
-/// Reporter that marshals log lines and (throttled) progress to the UI thread.
-struct GuiReporter {
-    weak: slint::Weak<AppWindow>,
-    last_pct: AtomicI32,
-}
+/// Launch the CLI (via pkexec when available) and stream its output to the UI.
+fn run_privileged(args: Vec<String>, weak: slint::Weak<AppWindow>) {
+    let cli = cli_path();
+    let (program, full_args) = if tool_exists("pkexec") {
+        let mut a = vec![cli.to_string_lossy().to_string()];
+        a.extend(args);
+        ("pkexec".to_string(), a)
+    } else {
+        (cli.to_string_lossy().to_string(), args)
+    };
 
-impl Reporter for GuiReporter {
-    fn log(&self, level: Level, message: &str) {
-        let line = format!("[{level}] {message}\n");
-        let weak = self.weak.clone();
-        let _ = slint::invoke_from_event_loop(move || {
-            if let Some(app) = weak.upgrade() {
-                let mut s = app.get_log().to_string();
-                s.push_str(&line);
-                app.set_log(s.into());
-            }
-        });
-    }
-
-    fn progress(&self, _operation: &str, fraction: f32) {
-        // Only push when the whole-percent value changes (avoid flooding the loop).
-        let pct = (fraction * 100.0) as i32;
-        if self.last_pct.swap(pct, Ordering::Relaxed) == pct {
+    let mut child = match Command::new(&program)
+        .args(&full_args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            finish(&weak, false, format!("Failed to launch `{program}`: {e}"));
             return;
         }
-        let frac = fraction.clamp(0.0, 1.0);
-        let text = format!("{pct}%");
-        let weak = self.weak.clone();
-        let _ = slint::invoke_from_event_loop(move || {
-            if let Some(app) = weak.upgrade() {
-                app.set_progress(frac);
-                app.set_progress_text(text.into());
-            }
-        });
+    };
+
+    if let Some(stderr) = child.stderr.take() {
+        stream_output(stderr, &weak);
     }
+
+    let mut stdout = String::new();
+    if let Some(mut so) = child.stdout.take() {
+        let _ = so.read_to_string(&mut stdout);
+    }
+    if !stdout.trim().is_empty() {
+        append_log(&weak, stdout.trim());
+    }
+
+    let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+    let msg = if ok {
+        stdout
+            .lines()
+            .last()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "Done.".to_string())
+    } else {
+        "Operation failed or was cancelled — see the log.".to_string()
+    };
+    finish(&weak, ok, msg);
+}
+
+/// Read the child's stderr, splitting on `\n`/`\r`, and route lines to either the
+/// progress bar (`op: NN%`) or the log.
+fn stream_output(stderr: std::process::ChildStderr, weak: &slint::Weak<AppWindow>) {
+    let mut reader = std::io::BufReader::new(stderr);
+    let mut buf: Vec<u8> = Vec::with_capacity(128);
+    let mut byte = [0u8; 1];
+    loop {
+        match reader.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => {
+                if byte[0] == b'\n' || byte[0] == b'\r' {
+                    if !buf.is_empty() {
+                        let line = String::from_utf8_lossy(&buf).trim().to_string();
+                        if !line.is_empty() {
+                            handle_line(&line, weak);
+                        }
+                        buf.clear();
+                    }
+                } else {
+                    buf.push(byte[0]);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+/// A line of CLI output → progress update or log line.
+fn handle_line(line: &str, weak: &slint::Weak<AppWindow>) {
+    if let Some(prefix) = line.strip_suffix('%') {
+        if let Some(num) = prefix.rsplit([' ', ':']).next() {
+            if let Ok(pct) = num.trim().parse::<f32>() {
+                let frac = (pct / 100.0).clamp(0.0, 1.0);
+                let text = format!("{}%", pct as i32);
+                let weak = weak.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(app) = weak.upgrade() {
+                        app.set_progress(frac);
+                        app.set_progress_text(text.into());
+                    }
+                });
+                return;
+            }
+        }
+    }
+    append_log(weak, line);
+}
+
+fn append_log(weak: &slint::Weak<AppWindow>, line: &str) {
+    let line = format!("{line}\n");
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(app) = weak.upgrade() {
+            let mut s = app.get_log().to_string();
+            s.push_str(&line);
+            app.set_log(s.into());
+        }
+    });
+}
+
+fn finish(weak: &slint::Weak<AppWindow>, ok: bool, msg: String) {
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(app) = weak.upgrade() {
+            app.set_busy(false);
+            app.set_status(
+                if ok {
+                    format!("✓ {msg}")
+                } else {
+                    format!("✗ {msg}")
+                }
+                .into(),
+            );
+            if ok {
+                app.set_progress(1.0);
+                app.set_progress_text("100%".into());
+            }
+        }
+    });
+}
+
+/// Path to the sibling `usbforge` CLI binary (falls back to `PATH`).
+fn cli_path() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let sibling = dir.join("usbforge");
+            if sibling.exists() {
+                return sibling;
+            }
+        }
+    }
+    PathBuf::from("usbforge")
+}
+
+fn tool_exists(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|p| p.join(name).is_file()))
+        .unwrap_or(false)
 }

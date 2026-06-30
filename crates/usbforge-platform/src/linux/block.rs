@@ -51,11 +51,15 @@ impl DiskAccess for LinuxDiskAccess {
     }
 }
 
-/// `O_EXCL` without pulling in the `libc` crate yet. Value is stable in the
-/// Linux ABI. Centralised here so it is easy to replace with `libc::O_EXCL`
-/// when we add the crate for ioctls.
+/// `O_EXCL` without pulling in the `libc` crate yet. On a block device this
+/// requests an exclusive open (fails if the disk is mounted / held). Value is
+/// stable in the Linux ABI across architectures (`0o200`). To be replaced with
+/// `libc::O_EXCL` / `rustix` when we add ioctls in M2.
+///
+/// (Note: `0o200000` is `O_DIRECTORY`, not `O_EXCL` — getting this wrong makes
+/// `open()` fail with `ENOTDIR` on a device node.)
 fn libc_o_excl() -> i32 {
-    0o0200000 // O_EXCL on Linux
+    0o200
 }
 
 struct LinuxBlockDevice {

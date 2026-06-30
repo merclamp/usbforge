@@ -43,11 +43,36 @@ pub struct IsoReport {
     pub isohybrid: bool,
     /// The image uses UDF (so it may hold files > 4 GiB, e.g. Windows ISOs).
     pub udf: bool,
+    /// Detected live-ISO persistence family, if any (Ubuntu casper / Debian live).
+    pub persistence: Option<PersistenceKind>,
 }
 
 impl IsoReport {
     pub fn is_uefi_bootable(&self) -> bool {
         !self.uefi_archs.is_empty()
+    }
+}
+
+/// Live-ISO family that supports a persistence overlay, and how to label it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistenceKind {
+    /// Ubuntu / casper — an ext4 partition labelled `casper-rw`.
+    Casper,
+    /// Debian / live-boot — an ext4 partition labelled `persistence` plus a
+    /// `persistence.conf` containing `/ union`.
+    LiveBoot,
+}
+
+impl PersistenceKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            PersistenceKind::Casper => "casper-rw",
+            PersistenceKind::LiveBoot => "persistence",
+        }
+    }
+    /// live-boot needs a `persistence.conf` file in the overlay; casper does not.
+    pub fn needs_conf(self) -> bool {
+        matches!(self, PersistenceKind::LiveBoot)
     }
 }
 
@@ -119,6 +144,17 @@ impl IsoReader {
             bios_bootloader: self.detect_bios_bootloader(),
             isohybrid: is_isohybrid(&self.path),
             udf: is_udf(&self.path),
+            persistence: self.detect_persistence(),
+        }
+    }
+
+    fn detect_persistence(&self) -> Option<PersistenceKind> {
+        if self.exists("/casper") || self.exists("/CASPER") {
+            Some(PersistenceKind::Casper)
+        } else if self.exists("/live") || self.exists("/LIVE") {
+            Some(PersistenceKind::LiveBoot)
+        } else {
+            None
         }
     }
 
@@ -156,6 +192,19 @@ impl IsoReader {
             region.start,
             crate::device::humanize_bytes(region.len)
         ));
+        self.install_to_region(target, region, label, reporter)
+    }
+
+    /// Format an existing partition region as FAT32 and extract the ISO tree
+    /// into it. Used both for the single-partition install and as the boot
+    /// partition of a persistence layout.
+    pub fn install_to_region(
+        &self,
+        target: &mut dyn BlockDevice,
+        region: layout::PartitionRegion,
+        label: &str,
+        reporter: &dyn Reporter,
+    ) -> Result<ExtractStats> {
         let mut slice = PartitionSlice::new(target, region.start, region.len);
         format_fat32(&mut slice, label)?;
         let fs = FileSystem::new(&mut slice, fat_options())

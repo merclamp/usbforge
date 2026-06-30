@@ -63,6 +63,9 @@ sudo target/release/usbforge create path/to/distro.iso /dev/sdX
 # Windows ISO (install.wim > 4 GiB)? Use NTFS + UEFI:NTFS (needs ntfs-3g):
 sudo target/release/usbforge create win.iso /dev/sdX --fs ntfs   # or --fs auto
 
+# Live Linux USB with a persistent ext4 overlay (needs e2fsprogs):
+sudo target/release/usbforge create ubuntu.iso /dev/sdX --persistence
+
 # For BIOS *and* UEFI boot of an isohybrid ISO (most Linux distros), raw-write it
 # — `inspect` reports "isohybrid: yes" when this applies:
 sudo target/release/usbforge write path/to/distro.iso /dev/sdX

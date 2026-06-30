@@ -103,6 +103,10 @@ enum Command {
         /// Filesystem: auto (NTFS for Windows ISOs, else FAT32), fat32, or ntfs.
         #[arg(long, value_enum, default_value = "auto")]
         fs: CreateFs,
+        /// Add an ext4 persistence partition for a live Linux USB (uses the
+        /// remaining space after the boot partition).
+        #[arg(long)]
+        persistence: bool,
         /// Volume label (default: the ISO's label, else USBFORGE).
         #[arg(long)]
         label: Option<String>,
@@ -176,10 +180,20 @@ fn main() -> Result<()> {
             device,
             scheme,
             fs,
+            persistence,
             label,
             yes,
             allow_fixed,
-        } => cmd_create(&iso, &device, scheme, fs, label, yes, allow_fixed),
+        } => cmd_create(
+            &iso,
+            &device,
+            scheme,
+            fs,
+            persistence,
+            label,
+            yes,
+            allow_fixed,
+        ),
     }
 }
 
@@ -484,11 +498,13 @@ fn cmd_format(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // mirrors the clap `create` subcommand fields
 fn cmd_create(
     iso_path: &str,
     device_arg: &str,
     scheme: SchemeArg,
     fs: CreateFs,
+    persistence: bool,
     label: Option<String>,
     yes: bool,
     allow_fixed: bool,
@@ -566,6 +582,17 @@ fn cmd_create(
     if !use_ntfs && reader.is_none() {
         bail!("this image needs NTFS mode (`--fs ntfs`); FAT32 file-copy can't read UDF");
     }
+    if persistence {
+        if use_ntfs {
+            bail!("--persistence is for Linux live ISOs (FAT32 boot), not NTFS");
+        }
+        if reader.is_none() {
+            bail!("--persistence needs a readable ISO9660 live image");
+        }
+        if !tool_exists("mkfs.ext4") {
+            bail!("--persistence needs `mkfs.ext4` — install e2fsprogs");
+        }
+    }
 
     let device = resolve_target(device_arg, allow_fixed)?;
     if let Some(r) = &report {
@@ -595,6 +622,9 @@ fn cmd_create(
             "FAT32"
         }
     );
+    if persistence {
+        eprintln!("  + ext4 persistence partition (uses the remaining space)");
+    }
     eprintln!(
         "\n  !! ALL DATA ON {} WILL BE PERMANENTLY DESTROYED. !!",
         device.path
@@ -602,7 +632,12 @@ fn cmd_create(
     confirm_destruction(yes, &device.path)?;
 
     let reporter = CliReporter::new();
-    let summary = if use_ntfs {
+    let summary = if persistence {
+        let reader = reader
+            .as_ref()
+            .expect("persistence requires a readable ISO");
+        create_persistence(&device, scheme, reader, report.as_ref(), &label, &reporter)?
+    } else if use_ntfs {
         create_uefi_ntfs(&device, scheme, iso_path, &label, &reporter)?
     } else {
         let reader = reader.expect("FAT path requires a readable ISO9660 image");
@@ -697,6 +732,97 @@ fn create_uefi_ntfs(
     Ok(format!(
         "copied {files} files ({}) to NTFS + wrote UEFI:NTFS bootloader",
         humanize_bytes(bytes)
+    ))
+}
+
+/// Persistence create (Linux, host-tool assisted): a boot FAT32 partition with
+/// the live ISO, plus an ext4 partition (the rest of the device) labelled for
+/// the distro's overlay (`casper-rw` / `persistence`).
+fn create_persistence(
+    device: &Device,
+    scheme: PartitionScheme,
+    reader: &IsoReader,
+    report: Option<&usbforge_core::iso::IsoReport>,
+    label: &str,
+    reporter: &CliReporter,
+) -> Result<String> {
+    use usbforge_core::layout;
+
+    let kind = report.and_then(|r| r.persistence);
+    if kind.is_none() {
+        eprintln!("  note: live-ISO family not detected; using `casper-rw` (Ubuntu) defaults.");
+    }
+    let persist_label = kind.map(|k| k.label()).unwrap_or("casper-rw");
+
+    // Boot partition holds the ISO + headroom; the ext4 data partition gets the rest.
+    let iso_bytes = report.map(|r| r.total_bytes).unwrap_or(0);
+    let boot_bytes = (iso_bytes + 128 * 1024 * 1024).max(256 * 1024 * 1024);
+
+    // 1) Two-partition layout + boot FAT32 + ISO extract, through the whole-disk handle.
+    let extract = {
+        let mut target = usbforge_platform::disk_access()
+            .open(device, Access::ReadWriteExclusive)
+            .context("failed to open device (need elevated privileges?)")?;
+        let (boot, data) = layout::write_boot_data_layout(&mut *target, scheme, boot_bytes)?;
+        eprintln!(
+            "Layout: boot FAT32 {} + ext4 persistence {} (label {persist_label}).",
+            humanize_bytes(boot.len),
+            humanize_bytes(data.len)
+        );
+        let stats = reader.install_to_region(&mut *target, boot, label, reporter)?;
+        target.sync()?;
+        stats
+    };
+
+    // 2) Re-read the partition table so /dev/sdX2 appears.
+    let _ = std::process::Command::new("partprobe")
+        .arg(&device.path)
+        .status();
+    let _ = std::process::Command::new("udevadm").arg("settle").status();
+    let data_part = partition_path(&device.path, 2);
+    let node = std::path::Path::new(&data_part);
+    for _ in 0..50 {
+        if node.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if !node.exists() {
+        bail!("persistence partition node {data_part} did not appear");
+    }
+
+    // 3) Format the persistence partition ext4 with the overlay label.
+    eprintln!("Formatting {data_part} as ext4 (label {persist_label}) …");
+    run_tool("mkfs.ext4", &["-F", "-q", "-L", persist_label, &data_part])
+        .context("mkfs.ext4 failed")?;
+
+    // 4) Debian live-boot needs a persistence.conf in the overlay.
+    if kind.map(|k| k.needs_conf()).unwrap_or(false) {
+        let mnt = std::env::temp_dir().join(format!("usbforge_persist_{}", std::process::id()));
+        std::fs::create_dir_all(&mnt)?;
+        let mnt_str = mnt.to_string_lossy().to_string();
+        run_tool("mount", &[&data_part, &mnt_str])
+            .context("mounting persistence partition failed")?;
+        let write_res = std::fs::write(mnt.join("persistence.conf"), b"/ union\n");
+        let _ = std::process::Command::new("sync").status();
+        let _ = std::process::Command::new("umount").arg(&mnt_str).status();
+        let _ = std::fs::remove_dir_all(&mnt);
+        write_res.context("writing persistence.conf failed")?;
+    }
+
+    eprintln!(
+        "Note: some distros also need a `{}` kernel parameter in the boot config to activate persistence.",
+        if matches!(kind, Some(usbforge_core::iso::PersistenceKind::LiveBoot)) {
+            "persistence"
+        } else {
+            "persistent"
+        }
+    );
+
+    Ok(format!(
+        "copied {} files ({}) + created ext4 persistence ({persist_label})",
+        extract.files,
+        humanize_bytes(extract.bytes)
     ))
 }
 

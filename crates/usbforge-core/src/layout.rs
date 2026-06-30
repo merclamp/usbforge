@@ -317,6 +317,123 @@ fn mbr_two_part(target: &mut dyn BlockDevice) -> Result<(PartitionRegion, Partit
     ))
 }
 
+// ---------------------------------------------------------------------------
+// Boot + data (persistence) layout
+// ---------------------------------------------------------------------------
+
+/// Lay down a boot FAT32 partition of `boot_bytes` (EFI-typed) followed by a
+/// Linux (ext4) data partition filling the rest of the device — used for live
+/// USBs with a persistence overlay. Returns `(boot, data)` regions.
+pub fn write_boot_data_layout(
+    target: &mut dyn BlockDevice,
+    scheme: PartitionScheme,
+    boot_bytes: u64,
+) -> Result<(PartitionRegion, PartitionRegion)> {
+    match scheme {
+        PartitionScheme::Gpt => gpt_boot_data(target, boot_bytes),
+        PartitionScheme::Mbr => mbr_boot_data(target, boot_bytes),
+    }
+}
+
+/// Minimum sensible ext4 persistence size.
+const MIN_DATA_BYTES: u64 = 32 * 1024 * 1024;
+
+fn gpt_boot_data(
+    target: &mut dyn BlockDevice,
+    boot_bytes: u64,
+) -> Result<(PartitionRegion, PartitionRegion)> {
+    use gpt::disk::LogicalBlockSize;
+    use gpt::{partition_types, GptConfig};
+
+    let total = target.size();
+    let total_lba = total / SECTOR;
+    let boot = boot_bytes.max(ALIGN_BYTES).div_ceil(ALIGN_BYTES) * ALIGN_BYTES;
+    let reserve = 2 * ALIGN_BYTES;
+    let data = total.saturating_sub(ALIGN_BYTES + boot + reserve) & !(ALIGN_BYTES - 1);
+    if data < MIN_DATA_BYTES {
+        return Err(Error::other("not enough space for a persistence partition"));
+    }
+
+    let lb = LogicalBlockSize::Lb512;
+    let align = Some(ALIGN_BYTES / SECTOR);
+    let (boot_region, data_region) = {
+        let mut disk = GptConfig::new()
+            .writable(true)
+            .logical_block_size(lb)
+            .create_from_device(GptDev(&mut *target), None)
+            .map_err(|e| Error::Other(format!("GPT init failed: {e}")))?;
+
+        let boot_id = disk
+            .add_partition("Boot", boot, partition_types::EFI, 0, align)
+            .map_err(|e| Error::Other(format!("GPT add boot failed: {e}")))?;
+        let data_id = disk
+            .add_partition("Persistence", data, partition_types::LINUX_FS, 0, align)
+            .map_err(|e| Error::Other(format!("GPT add data failed: {e}")))?;
+
+        let read_region = |id: u32| -> Result<PartitionRegion> {
+            let p = disk
+                .partitions()
+                .get(&id)
+                .ok_or_else(|| Error::other("partition not found"))?;
+            Ok(PartitionRegion {
+                start: p
+                    .bytes_start(lb)
+                    .map_err(|e| Error::Other(format!("region: {e}")))?,
+                len: p
+                    .bytes_len(lb)
+                    .map_err(|e| Error::Other(format!("region: {e}")))?,
+            })
+        };
+        let b = read_region(boot_id)?;
+        let d = read_region(data_id)?;
+
+        disk.write_inplace()
+            .map_err(|e| Error::Other(format!("GPT write failed: {e}")))?;
+        (b, d)
+    };
+
+    write_protective_mbr(target, total_lba)?;
+    Ok((boot_region, data_region))
+}
+
+fn mbr_boot_data(
+    target: &mut dyn BlockDevice,
+    boot_bytes: u64,
+) -> Result<(PartitionRegion, PartitionRegion)> {
+    let total = target.size();
+    let total_lba = total / SECTOR;
+    let align_lba = ALIGN_BYTES / SECTOR;
+    let boot_start = align_lba; // 2048
+    let boot_lba = (boot_bytes.max(ALIGN_BYTES).div_ceil(ALIGN_BYTES) * ALIGN_BYTES) / SECTOR;
+    let data_start = boot_start + boot_lba;
+    if data_start + align_lba >= total_lba {
+        return Err(Error::other("device too small for a persistence layout"));
+    }
+    let data_lba = (total_lba - data_start - align_lba) & !(align_lba - 1);
+    if data_lba * SECTOR < MIN_DATA_BYTES {
+        return Err(Error::other("not enough space for a persistence partition"));
+    }
+
+    let mut sector = [0u8; 512];
+    write_mbr_entry(&mut sector, 446, 0x0C, boot_start, boot_lba); // FAT32 LBA
+    write_mbr_entry(&mut sector, 462, 0x83, data_start, data_lba); // Linux
+    sector[510] = 0x55;
+    sector[511] = 0xAA;
+    target.seek(SeekFrom::Start(0))?;
+    target.write_all(&sector)?;
+
+    Ok((
+        PartitionRegion {
+            start: boot_start * SECTOR,
+            len: boot_lba * SECTOR,
+        },
+        PartitionRegion {
+            start: data_start * SECTOR,
+            len: data_lba * SECTOR,
+        },
+    ))
+}
+
 /// Fill a 16-byte MBR partition entry at `off` (LBA addressing, CHS placeholders).
 fn write_mbr_entry(
     sector: &mut [u8; 512],
@@ -384,6 +501,27 @@ mod tests {
         assert!(main.start + main.len <= esp.start);
         // Protective MBR present.
         assert_eq!(dev.data()[446 + 4], 0xEE);
+
+        use gpt::disk::LogicalBlockSize;
+        use gpt::GptConfig;
+        let disk = GptConfig::new()
+            .writable(false)
+            .logical_block_size(LogicalBlockSize::Lb512)
+            .open_from_device(GptDev(&mut dev))
+            .unwrap();
+        assert_eq!(disk.partitions().len(), 2);
+    }
+
+    #[test]
+    fn boot_data_persistence_layout_gpt() {
+        let mut dev = MemDevice::new(512 * 1024 * 1024);
+        let (boot, data) =
+            write_boot_data_layout(&mut dev, PartitionScheme::Gpt, 64 * 1024 * 1024).unwrap();
+
+        assert!(boot.len >= 64 * 1024 * 1024);
+        assert!(data.len >= MIN_DATA_BYTES);
+        assert!(boot.start + boot.len <= data.start);
+        assert_eq!(dev.data()[446 + 4], 0xEE); // protective MBR
 
         use gpt::disk::LogicalBlockSize;
         use gpt::GptConfig;

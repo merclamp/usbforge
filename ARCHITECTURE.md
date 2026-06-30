@@ -141,10 +141,17 @@ These surface in the UI as disabled/explained options rather than silent gaps.
   install.wim > 4 GiB). The NTFS create path reads the source via a kernel
   loop-mount (`mount -t udf`, falling back to autodetect), which yields the full
   UDF view incl. > 4 GiB files; `create` is tolerant of pure-UDF ISOs that cdfs
-  can't parse. Mount-based copy verified on hardware. _Still TODO: a pure-Rust
-  syslinux/GRUB installer for non-isohybrid BIOS boot; NTFS format/copy + UDF
-  mount currently use host tools (ntfs-3g, kernel udf) on Linux — the Windows
-  backend will use native APIs._
+  can't parse. Mount-based copy verified on hardware.
+  **Persistence (done):** `create --persistence` lays down a boot FAT32 (with the
+  live ISO) plus an ext4 partition filling the rest (`layout::write_boot_data_layout`),
+  `mkfs.ext4`-formats it with the distro overlay label (`iso::PersistenceKind`:
+  Ubuntu casper → `casper-rw`, Debian live-boot → `persistence` + a
+  `persistence.conf`). Two-partition + ext4 structure verified on hardware. _Still
+  TODO: inject the `persistent`/`persistence` kernel parameter into the boot
+  config (distro-specific, not boot-testable here); a pure-Rust syslinux/GRUB
+  installer for non-isohybrid BIOS boot. NTFS/ext4 format, UDF mount and the
+  persistence overlay use host tools (ntfs-3g, e2fsprogs, kernel udf) on Linux —
+  the Windows backend will use native APIs._
 - **M4 — Windows backend:** SetupAPI enumeration + `DeviceIoControl` disk access
   so the core runs on Windows.
 - **M5 — Windows UX:** WIM apply, TPM/Secure-Boot bypass via `hivex`, unattend,

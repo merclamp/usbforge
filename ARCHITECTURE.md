@@ -150,10 +150,19 @@ These surface in the UI as disabled/explained options rather than silent gaps.
   (`grub.cfg`/`loopback.cfg`/`isolinux`/`syslinux`, edited in-place through
   `fatfs`) to add the `persistent`/`persistence` kernel parameter that activates
   the overlay. Verified on hardware end-to-end (two partitions, ext4 `casper-rw`,
-  and the injected `… --- persistent` in the on-stick `grub.cfg`). _Still TODO: a
-  pure-Rust syslinux/GRUB installer for non-isohybrid BIOS boot. NTFS/ext4 format,
-  UDF mount and the persistence overlay use host tools (ntfs-3g, e2fsprogs, kernel
-  udf) on Linux — the Windows backend will use native APIs._
+  and the injected `… --- persistent` in the on-stick `grub.cfg`).
+  **BIOS syslinux (done):** `create --bios --scheme mbr` builds an MBR FAT32
+  partition, extracts the ISO, and installs syslinux for BIOS — the host
+  `syslinux` tool does the fiddly, boot-critical `ldlinux.sys` sector-map patch
+  (guaranteed correct), while USBForge writes the chainloading MBR + active flag
+  (`write_chainload_mbr`) and the `isolinux.cfg`→`syslinux.cfg` copy. The same
+  FAT partition keeps `/EFI/BOOT`, so it boots BIOS *and* UEFI. Verified on
+  hardware: chainload MBR, active partition, syslinux VBR, patched `ldlinux.sys`,
+  `ldlinux.c32`, and config all present. _Still TODO: a pure-Rust ldlinux patcher
+  (needs a FAT extent mapper; can't be boot-tested here). NTFS/ext4 format, UDF
+  mount, persistence overlay and syslinux install use host tools (ntfs-3g,
+  e2fsprogs, kernel udf, syslinux) on Linux — the Windows backend will use native
+  APIs._
 - **M4 — Windows backend:** SetupAPI enumeration + `DeviceIoControl` disk access
   so the core runs on Windows.
 - **M5 — Windows UX:** WIM apply, TPM/Secure-Boot bypass via `hivex`, unattend,

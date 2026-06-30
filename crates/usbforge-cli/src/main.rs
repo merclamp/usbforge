@@ -5,7 +5,7 @@
 //! `hash`/`inspect` exercise the image + hashing modules — all without any GUI.
 
 use std::collections::BTreeMap;
-use std::io::{IsTerminal, Write as _};
+use std::io::{IsTerminal, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -107,6 +107,10 @@ enum Command {
         /// remaining space after the boot partition).
         #[arg(long)]
         persistence: bool,
+        /// Install syslinux for BIOS boot of a non-isohybrid ISO (requires
+        /// --scheme mbr and the `syslinux` tool).
+        #[arg(long)]
+        bios: bool,
         /// Volume label (default: the ISO's label, else USBFORGE).
         #[arg(long)]
         label: Option<String>,
@@ -181,6 +185,7 @@ fn main() -> Result<()> {
             scheme,
             fs,
             persistence,
+            bios,
             label,
             yes,
             allow_fixed,
@@ -190,6 +195,7 @@ fn main() -> Result<()> {
             scheme,
             fs,
             persistence,
+            bios,
             label,
             yes,
             allow_fixed,
@@ -508,6 +514,7 @@ fn cmd_create(
     scheme: SchemeArg,
     fs: CreateFs,
     persistence: bool,
+    bios: bool,
     label: Option<String>,
     yes: bool,
     allow_fixed: bool,
@@ -596,6 +603,20 @@ fn cmd_create(
             bail!("--persistence needs `mkfs.ext4` — install e2fsprogs");
         }
     }
+    if bios {
+        if use_ntfs || persistence {
+            bail!("--bios can't be combined with NTFS or --persistence");
+        }
+        if scheme != PartitionScheme::Mbr {
+            bail!("--bios requires --scheme mbr (BIOS chainloading)");
+        }
+        if reader.is_none() {
+            bail!("--bios needs a readable ISO9660 image");
+        }
+        if !tool_exists("syslinux") {
+            bail!("--bios needs the `syslinux` tool — install syslinux");
+        }
+    }
 
     let device = resolve_target(device_arg, allow_fixed)?;
     if let Some(r) = &report {
@@ -628,6 +649,9 @@ fn cmd_create(
     if persistence {
         eprintln!("  + ext4 persistence partition (uses the remaining space)");
     }
+    if bios {
+        eprintln!("  + syslinux BIOS boot (chainload MBR)");
+    }
     eprintln!(
         "\n  !! ALL DATA ON {} WILL BE PERMANENTLY DESTROYED. !!",
         device.path
@@ -635,7 +659,10 @@ fn cmd_create(
     confirm_destruction(yes, &device.path)?;
 
     let reporter = CliReporter::new();
-    let summary = if persistence {
+    let summary = if bios {
+        let reader = reader.as_ref().expect("bios requires a readable ISO");
+        create_bios_syslinux(&device, reader, &label, &reporter)?
+    } else if persistence {
         let reader = reader
             .as_ref()
             .expect("persistence requires a readable ISO");
@@ -736,6 +763,141 @@ fn create_uefi_ntfs(
         "copied {files} files ({}) to NTFS + wrote UEFI:NTFS bootloader",
         humanize_bytes(bytes)
     ))
+}
+
+/// BIOS boot via host syslinux (Linux): create an MBR FAT32 partition, extract
+/// the ISO, install syslinux (its own tested ldlinux.sys patching) into the
+/// isolinux directory, and write a chainloading MBR with partition 1 marked
+/// active. The same FAT partition keeps the ISO's `/EFI/BOOT` files, so the
+/// result boots on both BIOS and UEFI.
+fn create_bios_syslinux(
+    device: &Device,
+    reader: &IsoReader,
+    label: &str,
+    reporter: &CliReporter,
+) -> Result<String> {
+    use usbforge_core::layout;
+
+    let mbr_bin = Path::new("/usr/lib/syslinux/bios/mbr.bin");
+    if !mbr_bin.exists() {
+        bail!("syslinux MBR not found at {}", mbr_bin.display());
+    }
+
+    // 1) MBR FAT32 partition + ISO extract, through the whole-disk handle.
+    let extract = {
+        let mut target = usbforge_platform::disk_access()
+            .open(device, Access::ReadWriteExclusive)
+            .context("failed to open device (need elevated privileges?)")?;
+        let region = layout::write_single_partition(
+            &mut *target,
+            PartitionScheme::Mbr,
+            FileSystem::Fat32,
+            label,
+            false,
+        )?;
+        eprintln!(
+            "Boot FAT32 partition created ({}).",
+            humanize_bytes(region.len)
+        );
+        let stats = reader.install_to_region(&mut *target, region, label, None, reporter)?;
+        target.sync()?;
+        stats
+    };
+
+    // 2) Re-read the partition table.
+    let _ = std::process::Command::new("partprobe")
+        .arg(&device.path)
+        .status();
+    let _ = std::process::Command::new("udevadm").arg("settle").status();
+    let part = partition_path(&device.path, 1);
+    let node = std::path::Path::new(&part);
+    for _ in 0..50 {
+        if node.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if !node.exists() {
+        bail!("boot partition node {part} did not appear");
+    }
+
+    // 3) Find the isolinux/syslinux config dir and provide a syslinux.cfg.
+    let cfg_dir = mount_prepare_syslinux_cfg(&part)?;
+
+    // 4) Install syslinux into that dir (unmounted) — its installer patches ldlinux.sys.
+    eprintln!("Installing syslinux into /{cfg_dir} …");
+    run_tool(
+        "syslinux",
+        &["--directory", &format!("/{cfg_dir}/"), "--install", &part],
+    )
+    .context("syslinux install failed")?;
+
+    // 5) Chainloading MBR + active flag.
+    write_chainload_mbr(&device.path, mbr_bin)?;
+
+    Ok(format!(
+        "copied {} files ({}) + installed syslinux (BIOS) into /{cfg_dir} + chainload MBR",
+        extract.files,
+        humanize_bytes(extract.bytes)
+    ))
+}
+
+/// Mount the boot FAT partition, locate the isolinux/syslinux config directory,
+/// copy `isolinux.cfg` to `syslinux.cfg` so syslinux finds it, and return the
+/// directory (relative path). Unmounts before returning.
+fn mount_prepare_syslinux_cfg(part: &str) -> Result<String> {
+    let mnt = std::env::temp_dir().join(format!("usbforge_syslinux_{}", std::process::id()));
+    std::fs::create_dir_all(&mnt)?;
+    let mnt_str = mnt.to_string_lossy().to_string();
+    run_tool("mount", &[part, &mnt_str]).context("mounting boot partition failed")?;
+
+    let result = (|| -> Result<String> {
+        let candidates = ["isolinux", "boot/isolinux", "syslinux", "boot/syslinux"];
+        let dir = candidates
+            .iter()
+            .copied()
+            .find(|d| {
+                mnt.join(d).join("isolinux.cfg").exists()
+                    || mnt.join(d).join("syslinux.cfg").exists()
+            })
+            .ok_or_else(|| {
+                anyhow!("no isolinux/syslinux config on the medium — is it a BIOS-bootable ISO?")
+            })?
+            .to_string();
+        let iso_cfg = mnt.join(&dir).join("isolinux.cfg");
+        let sys_cfg = mnt.join(&dir).join("syslinux.cfg");
+        if iso_cfg.exists() && !sys_cfg.exists() {
+            std::fs::copy(&iso_cfg, &sys_cfg).context("creating syslinux.cfg")?;
+        }
+        Ok(dir)
+    })();
+
+    let _ = std::process::Command::new("sync").status();
+    let _ = std::process::Command::new("umount").arg(&mnt_str).status();
+    let _ = std::fs::remove_dir_all(&mnt);
+    result
+}
+
+/// Write syslinux's chainloading boot code into LBA0 (preserving the partition
+/// table) and mark partition 1 active.
+fn write_chainload_mbr(device_path: &str, mbr_bin: &Path) -> Result<()> {
+    let code = std::fs::read(mbr_bin).context("reading syslinux mbr.bin")?;
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(device_path)
+        .with_context(|| format!("opening {device_path}"))?;
+    let mut lba0 = [0u8; 512];
+    f.read_exact(&mut lba0)?;
+    let n = code.len().min(440);
+    lba0[..n].copy_from_slice(&code[..n]);
+    lba0[446] = 0x80; // mark the first partition active
+    lba0[510] = 0x55;
+    lba0[511] = 0xAA;
+    f.seek(SeekFrom::Start(0))?;
+    f.write_all(&lba0)?;
+    f.sync_all()?;
+    Ok(())
 }
 
 /// Persistence create (Linux, host-tool assisted): a boot FAT32 partition with

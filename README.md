@@ -66,6 +66,9 @@ sudo target/release/usbforge create win.iso /dev/sdX --fs ntfs   # or --fs auto
 # Live Linux USB with a persistent ext4 overlay (needs e2fsprogs):
 sudo target/release/usbforge create ubuntu.iso /dev/sdX --persistence
 
+# BIOS boot for a non-isohybrid ISO via syslinux (needs the syslinux tool):
+sudo target/release/usbforge create distro.iso /dev/sdX --bios --scheme mbr
+
 # For BIOS *and* UEFI boot of an isohybrid ISO (most Linux distros), raw-write it
 # — `inspect` reports "isohybrid: yes" when this applies:
 sudo target/release/usbforge write path/to/distro.iso /dev/sdX

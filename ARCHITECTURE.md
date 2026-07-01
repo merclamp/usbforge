@@ -163,6 +163,12 @@ These surface in the UI as disabled/explained options rather than silent gaps.
   mount, persistence overlay and syslinux install use host tools (ntfs-3g,
   e2fsprogs, kernel udf, syslinux) on Linux — the Windows backend will use native
   APIs._
+- **ISO download (done):** `core::net` streams a URL to a file with progress and
+  on-the-fly SHA-256 verification (pure-Rust HTTP+TLS via `ureq`/rustls — works
+  on Windows too), plus a distro resolver (`resolve_alpine` reads Alpine's
+  release index). CLI `download <url|distro> [dest] [--sha256]`; verified over
+  the network (Alpine ISO, hash confirmed). _TODO: more distro resolvers;
+  Windows-ISO download (Fido/MS API) is a separate, brittle effort._
 - **M4 — Windows backend:** SetupAPI enumeration + `DeviceIoControl` disk access
   so the core runs on Windows.
 - **M5 — Windows UX:** WIM apply, TPM/Secure-Boot bypass via `hivex`, unattend,

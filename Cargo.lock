@@ -5514,6 +5514,7 @@ name = "usbforge-platform"
 version = "0.1.0"
 dependencies = [
  "usbforge-core",
+ "windows",
 ]
 
 [[package]]

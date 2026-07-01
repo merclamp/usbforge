@@ -23,6 +23,10 @@ pub mod filesystem;
 pub mod format;
 pub mod hash;
 pub mod image;
+// The full ISO reader (cdfs) is Unix-only; other targets get a stub with the
+// cross-platform helpers + an IsoReader that reports "not supported yet".
+#[cfg_attr(unix, path = "iso.rs")]
+#[cfg_attr(not(unix), path = "iso_stub.rs")]
 pub mod iso;
 pub mod layout;
 pub mod net;

@@ -1,40 +1,31 @@
-//! Windows backend (skeleton).
+//! Windows backend.
 //!
-//! Device enumeration will use SetupAPI / CfgMgr (`SetupDiGetClassDevs`,
-//! `CM_Get_*`) like Rufus `dev.c`; disk access will use `CreateFileW` on
-//! `\\.\PhysicalDriveN` plus `DeviceIoControl` (`IOCTL_DISK_*`, `FSCTL_*`).
-//! Those land via the `windows` crate behind the `cfg(windows)` dependency gate
-//! in `Cargo.toml`. For now the methods return a clear `Unsupported` error so
-//! the crate builds and links on Windows targets.
+//! Device enumeration probes `\\.\PhysicalDriveN` and queries
+//! `IOCTL_STORAGE_QUERY_PROPERTY` / `IOCTL_DISK_GET_LENGTH_INFO`. Disk access
+//! opens the physical drive with `CreateFileW` and drives it with `ReadFile` /
+//! `WriteFile` / `SetFilePointerEx` / `DeviceIoControl`, locking and dismounting
+//! the disk's volumes first for an exclusive write (the Windows equivalent of
+//! Rufus `drive.c`).
+//!
+//! This code is compiled only for Windows targets; on Linux it is
+//! `cfg`-excluded. It has been type-checked against `x86_64-pc-windows-gnu` but
+//! its runtime behaviour is exercised on real Windows.
 
-use usbforge_core::device::{Device, DeviceEnumerator};
-use usbforge_core::disk::{Access, BlockDevice, DiskAccess};
-use usbforge_core::{Error, Result};
+mod block;
+mod enumerate;
+
+use usbforge_core::device::DeviceEnumerator;
+use usbforge_core::disk::DiskAccess;
 
 pub fn enumerator() -> Box<dyn DeviceEnumerator> {
-    Box::new(WindowsEnumerator)
+    Box::new(enumerate::WindowsEnumerator)
 }
 
 pub fn disk_access() -> Box<dyn DiskAccess> {
-    Box::new(WindowsDiskAccess)
+    Box::new(block::WindowsDiskAccess)
 }
 
-struct WindowsEnumerator;
-
-impl DeviceEnumerator for WindowsEnumerator {
-    fn list(&self, _only_removable: bool) -> Result<Vec<Device>> {
-        Err(Error::unsupported(
-            "Windows device enumeration (SetupAPI) not implemented yet",
-        ))
-    }
-}
-
-struct WindowsDiskAccess;
-
-impl DiskAccess for WindowsDiskAccess {
-    fn open(&self, _device: &Device, _access: Access) -> Result<Box<dyn BlockDevice>> {
-        Err(Error::unsupported(
-            "Windows disk access (CreateFile/DeviceIoControl) not implemented yet",
-        ))
-    }
+/// Null-terminated UTF-16 buffer for a Win32 wide-string path.
+pub(crate) fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
 }

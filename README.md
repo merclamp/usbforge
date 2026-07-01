@@ -25,7 +25,7 @@ reporting seams instead of global `uprintf()` / `SendMessage` glue.
 | Crate | Role |
 |-------|------|
 | `usbforge-core` | Platform-agnostic domain model, traits (HAL), hashing, reporting. No OS or GUI code. |
-| `usbforge-platform` | Per-OS backends behind the core traits (Linux: sysfs/ioctl; Windows: SetupAPI/DeviceIoControl). |
+| `usbforge-platform` | Per-OS backends behind the core traits (Linux: sysfs/ioctl; Windows: `CreateFileW`/`DeviceIoControl` — **experimental**, compiles but not yet run on real Windows). |
 | `usbforge-cli` | Headless frontend + proof-of-concept (`usbforge` binary). |
 | `usbforge-gui` | Slint GUI: device picker, write/format/create, live progress + log. |
 

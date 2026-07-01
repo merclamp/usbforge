@@ -169,8 +169,19 @@ These surface in the UI as disabled/explained options rather than silent gaps.
   release index). CLI `download <url|distro> [dest] [--sha256]`; verified over
   the network (Alpine ISO, hash confirmed). _TODO: more distro resolvers;
   Windows-ISO download (Fido/MS API) is a separate, brittle effort._
-- **M4 — Windows backend:** SetupAPI enumeration + `DeviceIoControl` disk access
-  so the core runs on Windows.
+- **M4 — Windows backend (experimental):** `platform/src/windows` implements the
+  same traits with the `windows` crate — enumeration by probing
+  `\\.\PhysicalDriveN` + `IOCTL_STORAGE_QUERY_PROPERTY`/`IOCTL_DISK_GET_LENGTH_INFO`,
+  and a `WindowsBlockDevice` over `CreateFileW` + `ReadFile`/`WriteFile`/
+  `SetFilePointerEx`/`FlushFileBuffers`, locking+dismounting the disk's volumes
+  first for an exclusive write. To let `usbforge-core` build on Windows at all,
+  `cdfs` (which pulls the Unix-only `fuser`) is gated to Unix and the `iso`
+  module falls back to `iso_stub.rs` — so on Windows `list`/`write`/`format`/
+  `download` work but ISO file-copy `create`/`inspect` report "not supported yet"
+  (needs a cross-platform ISO reader). **Type-checked against
+  `x86_64-pc-windows-gnu`; not yet run on real Windows** — hence experimental.
+  _TODO: runtime testing; a cross-platform ISO reader; UAC elevation for the GUI;
+  sector-aligned I/O._
 - **M5 — Windows UX:** WIM apply, TPM/Secure-Boot bypass via `hivex`, unattend,
   persistence; Fido download; signature checks.
 - **M6 — GUI (done):** Slint window — device dropdown + refresh, image picker

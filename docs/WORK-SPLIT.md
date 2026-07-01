@@ -167,8 +167,17 @@ with the Linux PoC, using the **exact same** `core::write` engine and CLI.
   engine — done and unit-tested (runs on both OSes).
 - **Linux backend:** device enumeration + raw write — done, verified on real
   hardware.
-- **Windows backend:** stubs returning `Unsupported` — **the Windows side's
-  starting point** (see quick-start above).
-- **CLI:** `list`, `inspect`, `hash`, `write` — shared, works wherever a backend
-  is implemented.
-- **GUI:** placeholder.
+- **Windows backend:** **experimental** — enumeration (`\\.\PhysicalDriveN` +
+  `IOCTL_STORAGE_QUERY_PROPERTY`) and disk I/O (`CreateFileW` + `DeviceIoControl`
+  + volume lock/dismount) are implemented in `platform/src/windows` against the
+  `windows` crate. Type-checks for `x86_64-pc-windows-gnu` but has **not been run
+  on real Windows** — that's the Windows side's job: build (`cargo build`),
+  `list`, then `write` to a spare stick, and refine (sector alignment, error
+  messages). ISO `create` needs a cross-platform ISO reader (cdfs is Unix-only).
+- **CLI/GUI:** shared, build on both OSes; on Windows `create`/ISO-`inspect`
+  report "not supported yet" until a cross-platform ISO reader lands.
+
+> Cross-checking the Windows build from Linux: `rustup target add
+> x86_64-pc-windows-gnu`, install mingw-w64, then
+> `cargo check --target x86_64-pc-windows-gnu -p usbforge-core -p usbforge-platform -p usbforge-cli`
+> (type-checks without a Windows box; CI's `windows-latest` job does the real build).

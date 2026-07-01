@@ -15,5 +15,10 @@ hex.workspace = true
 # Partition tables (GPT) and FAT formatting — pure-Rust, cross-platform.
 gpt = "4.1.0"
 fatfs = { version = "0.3.6", default-features = false, features = ["std", "alloc"] }
-cdfs = "0.2.3"
 ureq = "2"
+
+# ISO9660 reading. cdfs pulls `fuser` (a Unix-only FUSE crate) unconditionally,
+# so it can't build on Windows — gate it to Unix. On other targets the `iso`
+# module falls back to a stub (see iso_stub.rs / lib.rs).
+[target.'cfg(unix)'.dependencies]
+cdfs = "0.2.3"

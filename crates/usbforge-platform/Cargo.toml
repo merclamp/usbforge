@@ -9,6 +9,11 @@ description = "Per-OS backends implementing usbforge-core traits (Linux: sysfs/i
 [dependencies]
 usbforge-core.workspace = true
 
-# Windows backend deps land here behind a target gate when implemented, e.g.:
-# [target.'cfg(windows)'.dependencies]
-# windows = { version = "0.58", features = ["Win32_Storage_FileSystem", "Win32_System_Ioctl"] }
+[target."cfg(windows)".dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Ioctl",
+    "Win32_System_IO",
+] }

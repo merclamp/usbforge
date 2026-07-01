@@ -106,7 +106,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             app.set_status(format!("Authorising and working on {} …", device.path).into());
 
             let weak = weak.clone();
-            std::thread::spawn(move || run_privileged(args, weak));
+            std::thread::spawn(move || run_cli(args, weak, true, None));
+        });
+    }
+
+    // Download: pick a save location (native save dialog).
+    {
+        let weak = app.as_weak();
+        app.on_download_browse(move || {
+            if let Some(file) = rfd::FileDialog::new()
+                .set_file_name("download.iso")
+                .save_file()
+            {
+                if let Some(app) = weak.upgrade() {
+                    app.set_download_dest(file.display().to_string().into());
+                }
+            }
+        });
+    }
+
+    // Download an ISO by URL / distro shortcut (no elevation needed).
+    {
+        let weak = app.as_weak();
+        app.on_download(move || {
+            let app = match weak.upgrade() {
+                Some(a) => a,
+                None => return,
+            };
+            let source = app.get_download_source().to_string();
+            if source.trim().is_empty() {
+                app.set_status("Enter a URL or a distro shortcut (e.g. alpine:virt).".into());
+                return;
+            }
+            let dest = app.get_download_dest().to_string();
+            if dest.trim().is_empty() {
+                app.set_status("Choose where to save the download first.".into());
+                return;
+            }
+
+            let args = vec!["download".to_string(), source, dest.clone()];
+
+            app.set_busy(true);
+            app.set_progress(0.0);
+            app.set_progress_text("0%".into());
+            app.set_log(SharedString::from(""));
+            app.set_status("Downloading …".into());
+
+            let weak = weak.clone();
+            std::thread::spawn(move || run_cli(args, weak, false, Some(dest)));
         });
     }
 
@@ -190,10 +237,18 @@ fn build_cli_args(
     }
 }
 
-/// Launch the CLI (via pkexec when available) and stream its output to the UI.
-fn run_privileged(args: Vec<String>, weak: slint::Weak<AppWindow>) {
+/// Launch the CLI and stream its output to the UI. When `elevate` is set the
+/// command runs via pkexec (needed for device operations). On success, if
+/// `set_image_on_success` is given, that path is written into the image field
+/// (used after a download so it feeds create/write).
+fn run_cli(
+    args: Vec<String>,
+    weak: slint::Weak<AppWindow>,
+    elevate: bool,
+    set_image_on_success: Option<String>,
+) {
     let cli = cli_path();
-    let (program, full_args) = if tool_exists("pkexec") {
+    let (program, full_args) = if elevate && tool_exists("pkexec") {
         let mut a = vec![cli.to_string_lossy().to_string()];
         a.extend(args);
         ("pkexec".to_string(), a)
@@ -236,6 +291,17 @@ fn run_privileged(args: Vec<String>, weak: slint::Weak<AppWindow>) {
     } else {
         "Operation failed or was cancelled — see the log.".to_string()
     };
+
+    if ok {
+        if let Some(path) = set_image_on_success {
+            let w = weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(app) = w.upgrade() {
+                    app.set_image_path(path.into());
+                }
+            });
+        }
+    }
     finish(&weak, ok, msg);
 }
 

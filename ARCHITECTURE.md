@@ -178,8 +178,10 @@ These surface in the UI as disabled/explained options rather than silent gaps.
   scheme/label fields, erase confirmation, progress bar + log. Enumeration runs
   in-process; the destructive op is delegated to the `usbforge` CLI via
   **pkexec** (native PolicyKit prompt; the GUI never runs as root), and the CLI's
-  stderr is parsed back into the progress bar + log. Verified rendering on
-  Wayland with a real device + the NTFS selector. _TODO: dark mode polish, i18n,
+  stderr is parsed back into the progress bar + log. An ISO downloader section
+  runs `usbforge download` directly (no elevation) and feeds the fetched file
+  into the image field. Verified rendering on Wayland with a real device, the
+  NTFS selector and the download section. _TODO: dark mode polish, i18n,
   cancel button, Windows UAC elevation path._
 - **M7 — Packaging:** deb/rpm/AppImage/Flatpak (Linux), MSI/portable (Windows);
   CI matrix.

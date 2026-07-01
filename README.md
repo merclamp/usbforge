@@ -84,7 +84,8 @@ cargo test
 ### GUI
 
 A Slint desktop GUI wraps the same engine — device dropdown, image picker,
-write/format/create modes (with a FAT32/NTFS/auto selector), progress bar + log:
+write/format/create modes (with a FAT32/NTFS/auto selector), an ISO downloader,
+progress bar + log:
 
 ```sh
 cargo run -p usbforge-gui          # run as a normal user

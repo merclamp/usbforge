@@ -25,11 +25,15 @@ export component AppWindow inherits Window {
     in-out property <string> image-path;
     in-out property <string> volume-label: "USBFORGE";
     in-out property <bool> confirm-erase: false;
+    in-out property <string> download-source;
+    in-out property <string> download-dest;
 
     // --- callbacks to Rust ---
     callback refresh();
     callback browse();
     callback start();
+    callback download();
+    callback download-browse();
 
     VerticalBox {
         padding: 16px;
@@ -105,6 +109,37 @@ export component AppWindow inherits Window {
                         current-index <=> create-fs-index;
                         enabled: !busy;
                         horizontal-stretch: 1;
+                    }
+                }
+            }
+        }
+
+        GroupBox {
+            title: "Download ISO (optional)";
+            VerticalBox {
+                spacing: 8px;
+                LineEdit {
+                    placeholder-text: "https URL, or a distro shortcut (e.g. alpine:virt)";
+                    text <=> download-source;
+                    enabled: !busy;
+                }
+                HorizontalBox {
+                    spacing: 8px;
+                    LineEdit {
+                        placeholder-text: "Save to …";
+                        text <=> download-dest;
+                        enabled: !busy;
+                        horizontal-stretch: 1;
+                    }
+                    Button {
+                        text: "Save as…";
+                        enabled: !busy;
+                        clicked => { download-browse(); }
+                    }
+                    Button {
+                        text: "Download";
+                        enabled: !busy;
+                        clicked => { download(); }
                     }
                 }
             }

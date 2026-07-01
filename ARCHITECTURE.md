@@ -55,7 +55,7 @@ cross-platform (Linux + Windows) application.
 | ext2/3/4 | `format_ext.c`, `ext2fs/` (e2fsprogs fork) | `core::fs::ext` | shell `mkfs.ext4` or FFI e2fsprogs |
 | Boot records | `ms-sys/` (originally a Linux tool) | `core::boot` | reimplement writers (small, GPLv3) over `BlockDevice` |
 | Syslinux/GRUB | `syslinux/`, `res/grub*` | `core::boot::loaders` | embed payloads, install over `BlockDevice` |
-| ISO read/extract | `iso.c`, `libcdio/` | `core::image::iso` | `cdfs` crate (ISO9660) + UDF; I/O via std |
+| ISO read/extract | `iso.c`, `libcdio/` | `core::image::iso` | own pure-Rust ISO9660+Joliet reader (`iso9660.rs`) + UDF; I/O via std |
 | Decompression | `bled/` (busybox fork) | `core::image::compressed` | `flate2`, `xz2`, `zstd`, `bzip2` crates |
 | WIM (To Go / WUE) | `wimlib/` | `core::image::wim` | FFI to upstream `wimlib` |
 | Hashing | `hash.c` | `core::hash` (done) | RustCrypto: `sha2`, `sha1`, `md-5` |
@@ -73,7 +73,8 @@ cross-platform (Linux + Windows) application.
 - **Low-level device ops:** `nix`/`rustix` (ioctls, Linux), `windows` (Win32).
 - **Partition tables:** `gpt`, `mbrman`.
 - **Filesystems:** `fatfs` (FAT), FFI/`mkfs` for ext4/exFAT/NTFS.
-- **Images:** `cdfs` (ISO9660), `flate2`/`xz2`/`zstd`/`bzip2` (compression),
+- **Images:** own pure-Rust ISO9660+Joliet reader (`iso9660.rs`, no external
+  crate — cross-platform), `flate2`/`xz2`/`zstd`/`bzip2` (compression),
   FFI `wimlib` (WIM).
 - **Registry hives (offline):** `hivex` (FFI) for the Win11 TPM-bypass edits.
 - **Hashing:** `sha2`, `sha1`, `md-5`, `hex` (in use).
@@ -118,8 +119,9 @@ These surface in the UI as disabled/explained options rather than silent gaps.
   write-protected, size check, typed confirmation). _Still TODO: `O_DIRECT` +
   aligned I/O for throughput, `BLKRRPART`/volume locking, compressed sources._
 - **M2 — Partitioning + format:** GPT/MBR via `gpt`/`mbrman`; FAT32/exFAT/ext4.
-- **M3 — ISO + UEFI file-copy (done):** ISO9660 read/scan via `cdfs`
-  (`core::iso`: volume label, file/byte totals, UEFI-arch + Windows-installer +
+- **M3 — ISO + UEFI file-copy (done):** ISO9660 read/scan via our own pure-Rust
+  reader (`core::iso9660`, ISO9660 + Joliet, no external crate → cross-platform;
+  `core::iso`: volume label, file/byte totals, UEFI-arch + Windows-installer +
   BIOS-loader detection); recursive extraction into a FAT32 volume via `fatfs`;
   CLI `create` = GPT(+PMBR)/MBR with an **EFI System Partition** + FAT32 + ISO
   extraction → UEFI-bootable media. Verified on hardware with a real Alpine ISO
@@ -140,8 +142,8 @@ These surface in the UI as disabled/explained options rather than silent gaps.
   (NSR02/NSR03 in the Volume Recognition Sequence — that's how Windows ISOs hold
   install.wim > 4 GiB). The NTFS create path reads the source via a kernel
   loop-mount (`mount -t udf`, falling back to autodetect), which yields the full
-  UDF view incl. > 4 GiB files; `create` is tolerant of pure-UDF ISOs that cdfs
-  can't parse. Mount-based copy verified on hardware.
+  UDF view incl. > 4 GiB files; `create` is tolerant of pure-UDF ISOs that the
+  ISO9660 reader can't parse. Mount-based copy verified on hardware.
   **Persistence (done):** `create --persistence` lays down a boot FAT32 (with the
   live ISO) plus an ext4 partition filling the rest (`layout::write_boot_data_layout`),
   `mkfs.ext4`-formats it with the distro overlay label (`iso::PersistenceKind`:
@@ -174,14 +176,13 @@ These surface in the UI as disabled/explained options rather than silent gaps.
   `\\.\PhysicalDriveN` + `IOCTL_STORAGE_QUERY_PROPERTY`/`IOCTL_DISK_GET_LENGTH_INFO`,
   and a `WindowsBlockDevice` over `CreateFileW` + `ReadFile`/`WriteFile`/
   `SetFilePointerEx`/`FlushFileBuffers`, locking+dismounting the disk's volumes
-  first for an exclusive write. To let `usbforge-core` build on Windows at all,
-  `cdfs` (which pulls the Unix-only `fuser`) is gated to Unix and the `iso`
-  module falls back to `iso_stub.rs` — so on Windows `list`/`write`/`format`/
-  `download` work but ISO file-copy `create`/`inspect` report "not supported yet"
-  (needs a cross-platform ISO reader). **Type-checked against
-  `x86_64-pc-windows-gnu`; not yet run on real Windows** — hence experimental.
-  _TODO: runtime testing; a cross-platform ISO reader; UAC elevation for the GUI;
-  sector-aligned I/O._
+  first for an exclusive write. The `iso` module now uses our own pure-Rust
+  ISO9660+Joliet reader (`iso9660.rs`, no `cdfs`/`fuser`), so `list`/`inspect`/
+  `write`/`format`/`create` (FAT32 ISO file-copy) and `download` all build on
+  Windows. **Type-checked against `x86_64-pc-windows-gnu`; not yet run on real
+  Windows** — hence experimental. _TODO: runtime testing; UAC elevation for the
+  GUI; sector-aligned I/O; the host-tool paths (NTFS/ext4 format, UDF mount,
+  syslinux) still need native-Windows equivalents._
 - **M5 — Windows UX:** WIM apply, TPM/Secure-Boot bypass via `hivex`, unattend,
   persistence; Fido download; signature checks.
 - **M6 — GUI (done):** Slint window — device dropdown + refresh, image picker

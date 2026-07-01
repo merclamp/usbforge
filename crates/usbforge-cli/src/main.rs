@@ -537,8 +537,8 @@ fn cmd_create(
 ) -> Result<()> {
     let scheme: PartitionScheme = scheme.into();
     let udf = iso::is_udf(iso_path);
-    // cdfs reads ISO9660; pure-UDF Windows ISOs won't parse — fine, the NTFS
-    // path reads them through a kernel mount instead.
+    // Our ISO9660 reader parses ISO9660/Joliet; pure-UDF Windows ISOs won't
+    // parse — fine, the NTFS path reads them through a kernel mount instead.
     let reader = IsoReader::open(iso_path).ok();
     let report = reader.as_ref().map(|r| r.report());
 

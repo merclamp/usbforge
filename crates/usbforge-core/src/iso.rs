@@ -1,28 +1,28 @@
 //! ISO9660 reading, bootability analysis, and tree extraction
-//! (Rufus `iso.c` / `ImageScanThread` + libcdio).
+//! (Rufus `iso.c` / `ImageScanThread`).
 //!
-//! Reads an ISO with the pure-Rust `cdfs` crate and can copy its whole directory
-//! tree into a FAT filesystem via `fatfs` — the basis of "file-copy" bootable
-//! media. For UEFI machines that alone is enough: firmware boots
-//! `/EFI/BOOT/BOOT*.EFI` straight from the FAT32 partition, no bootloader install.
+//! Reads an ISO with our own pure-Rust reader ([`crate::iso9660`]) and copies
+//! its whole directory tree into a FAT filesystem via `fatfs` — the basis of
+//! "file-copy" bootable media. For UEFI machines that alone is enough: firmware
+//! boots `/EFI/BOOT/BOOT*.EFI` straight from the FAT32 partition.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use cdfs::{DirectoryEntry, ISODirectory, ISO9660};
 use fatfs::{Dir, FileSystem, FsOptions, ReadWriteSeek};
 
 use crate::disk::BlockDevice;
 use crate::filesystem::{FileSystem as Fs, PartitionScheme};
 use crate::format::{format_fat32, PartitionSlice};
+use crate::iso9660::{DirEntry, Iso};
 use crate::layout;
 use crate::report::{Reporter, ReporterExt};
 use crate::{Error, Result};
 
 /// An opened ISO9660 image.
 pub struct IsoReader {
-    iso: ISO9660<File>,
+    iso: Iso,
     path: PathBuf,
 }
 
@@ -89,7 +89,6 @@ pub fn is_udf(path: impl AsRef<Path>) -> bool {
     if file.seek(SeekFrom::Start(16 * 2048)).is_err() {
         return false;
     }
-    // The Volume Recognition Sequence lives in the first handful of sectors.
     let mut buf = vec![0u8; 16 * 2048];
     let n = match file.read(&mut buf) {
         Ok(n) => n,
@@ -127,16 +126,15 @@ impl IsoReader {
     pub fn open(path: impl AsRef<Path>) -> Result<IsoReader> {
         let path = path.as_ref().to_path_buf();
         let file = File::open(&path)?;
-        let iso = ISO9660::new(file)
-            .map_err(|e| Error::Image(format!("not a valid ISO9660 image: {e}")))?;
+        let iso = Iso::open(file)?;
         Ok(IsoReader { iso, path })
     }
 
     /// Scan the image: volume label, total size/file count, and bootability.
     pub fn report(&self) -> IsoReport {
-        let (total_files, total_bytes) = dir_totals(self.iso.root());
+        let (total_files, total_bytes) = dir_totals(&self.iso, &self.iso.root());
         IsoReport {
-            volume_label: self.read_volume_label(),
+            volume_label: self.iso.volume_label().to_string(),
             total_bytes,
             total_files,
             uefi_archs: self.detect_uefi(),
@@ -149,9 +147,9 @@ impl IsoReader {
     }
 
     fn detect_persistence(&self) -> Option<PersistenceKind> {
-        if self.exists("/casper") || self.exists("/CASPER") {
+        if self.exists("/casper") {
             Some(PersistenceKind::Casper)
-        } else if self.exists("/live") || self.exists("/LIVE") {
+        } else if self.exists("/live") {
             Some(PersistenceKind::LiveBoot)
         } else {
             None
@@ -164,13 +162,20 @@ impl IsoReader {
         fs: &FileSystem<W>,
         reporter: &dyn Reporter,
     ) -> Result<ExtractStats> {
-        let (_, total) = dir_totals(self.iso.root());
+        let (_, total) = dir_totals(&self.iso, &self.iso.root());
         reporter.info(&format!(
             "Extracting {} of files to the target filesystem …",
             crate::device::humanize_bytes(total)
         ));
         let mut stats = ExtractStats::default();
-        copy_dir(self.iso.root(), &fs.root_dir(), total, &mut stats, reporter)?;
+        copy_dir(
+            &self.iso,
+            &self.iso.root(),
+            &fs.root_dir(),
+            total,
+            &mut stats,
+            reporter,
+        )?;
         reporter.progress("extract", 1.0);
         Ok(stats)
     }
@@ -230,19 +235,26 @@ impl IsoReader {
     /// filesystem (used for the UEFI:NTFS path, where the target NTFS volume is
     /// mounted by the OS and we copy into it).
     pub fn extract_to_dir(&self, dir: &Path, reporter: &dyn Reporter) -> Result<ExtractStats> {
-        let (_, total) = dir_totals(self.iso.root());
+        let (_, total) = dir_totals(&self.iso, &self.iso.root());
         reporter.info(&format!(
             "Extracting {} to the mounted volume …",
             crate::device::humanize_bytes(total)
         ));
         let mut stats = ExtractStats::default();
-        copy_dir_to_fs(self.iso.root(), dir, total, &mut stats, reporter)?;
+        copy_dir_to_fs(
+            &self.iso,
+            &self.iso.root(),
+            dir,
+            total,
+            &mut stats,
+            reporter,
+        )?;
         reporter.progress("extract", 1.0);
         Ok(stats)
     }
 
     fn exists(&self, path: &str) -> bool {
-        matches!(self.iso.open(path), Ok(Some(_)))
+        matches!(self.iso.find(path), Ok(Some(_)))
     }
 
     fn exists_any(&self, paths: &[&str]) -> bool {
@@ -258,12 +270,8 @@ impl IsoReader {
         ];
         let mut found = Vec::new();
         for (fname, arch) in CANDIDATES {
-            // Try common case spellings (ISO9660 upper-cases; Joliet preserves).
-            let variants = [
-                format!("/EFI/BOOT/{fname}"),
-                format!("/efi/boot/{}", fname.to_ascii_lowercase()),
-            ];
-            if variants.iter().any(|p| self.exists(p)) {
+            // Lookup is case-insensitive, so one spelling suffices.
+            if self.exists(&format!("/EFI/BOOT/{fname}")) {
                 found.push(arch.to_string());
             }
         }
@@ -271,131 +279,94 @@ impl IsoReader {
     }
 
     fn detect_bios_bootloader(&self) -> Option<String> {
-        if self.exists_any(&["/isolinux/isolinux.bin", "/ISOLINUX/ISOLINUX.BIN"]) {
+        if self.exists("/isolinux/isolinux.bin") {
             Some("isolinux".to_string())
-        } else if self.exists_any(&["/boot/grub/i386-pc", "/boot/grub"]) {
+        } else if self.exists("/boot/grub/i386-pc") || self.exists("/boot/grub") {
             Some("grub".to_string())
         } else {
             None
         }
     }
-
-    /// Read the volume identifier straight from the Primary Volume Descriptor
-    /// (LBA 16, offset 40, 32 bytes) — `cdfs` doesn't expose it directly.
-    fn read_volume_label(&self) -> String {
-        let mut f = match File::open(&self.path) {
-            Ok(f) => f,
-            Err(_) => return String::new(),
-        };
-        if f.seek(SeekFrom::Start(16 * 2048 + 40)).is_err() {
-            return String::new();
-        }
-        let mut buf = [0u8; 32];
-        if f.read_exact(&mut buf).is_err() {
-            return String::new();
-        }
-        String::from_utf8_lossy(&buf).trim().to_string()
-    }
 }
 
-/// Recursively copy a cdfs directory into a fatfs directory.
+/// Recursively copy an ISO directory into a fatfs directory.
 fn copy_dir<W: ReadWriteSeek>(
-    src: &ISODirectory<File>,
+    iso: &Iso,
+    dir: &DirEntry,
     dst: &Dir<'_, W>,
     total: u64,
     stats: &mut ExtractStats,
     reporter: &dyn Reporter,
 ) -> Result<()> {
-    for entry in src.contents() {
-        let entry = entry.map_err(|e| Error::Image(format!("ISO read error: {e}")))?;
-        let name = clean_name(entry.identifier());
-        if is_special(&name) {
+    for entry in iso.read_dir(dir)? {
+        if entry.name.is_empty() {
             continue;
         }
-        match entry {
-            DirectoryEntry::Directory(dir) => {
-                let sub = dst
-                    .create_dir(&name)
-                    .map_err(|e| Error::Other(format!("creating dir {name:?}: {e}")))?;
-                copy_dir(&dir, &sub, total, stats, reporter)?;
+        if entry.is_dir {
+            let sub = dst
+                .create_dir(&entry.name)
+                .map_err(|e| Error::Other(format!("creating dir {:?}: {e}", entry.name)))?;
+            copy_dir(iso, &entry, &sub, total, stats, reporter)?;
+        } else {
+            let mut writer = dst
+                .create_file(&entry.name)
+                .map_err(|e| Error::Other(format!("creating file {:?}: {e}", entry.name)))?;
+            iso.copy_file(&entry, &mut writer)?;
+            stats.files += 1;
+            stats.bytes += u64::from(entry.size);
+            if total > 0 {
+                reporter.progress("extract", stats.bytes as f32 / total as f32);
             }
-            DirectoryEntry::File(file) => {
-                let mut writer = dst
-                    .create_file(&name)
-                    .map_err(|e| Error::Other(format!("creating file {name:?}: {e}")))?;
-                let mut reader = file.read();
-                std::io::copy(&mut reader, &mut writer)
-                    .map_err(|e| Error::Other(format!("copying {name:?}: {e}")))?;
-                stats.files += 1;
-                stats.bytes += u64::from(file.size());
-                if total > 0 {
-                    reporter.progress("extract", stats.bytes as f32 / total as f32);
-                }
-            }
-            // Symlinks aren't representable on FAT; skip them.
-            _ => {}
         }
     }
     Ok(())
 }
 
-/// Recursively copy a cdfs directory into a real filesystem directory.
+/// Recursively copy an ISO directory into a real filesystem directory.
 fn copy_dir_to_fs(
-    src: &ISODirectory<File>,
+    iso: &Iso,
+    dir: &DirEntry,
     dst: &Path,
     total: u64,
     stats: &mut ExtractStats,
     reporter: &dyn Reporter,
 ) -> Result<()> {
     std::fs::create_dir_all(dst)?;
-    for entry in src.contents() {
-        let entry = entry.map_err(|e| Error::Image(format!("ISO read error: {e}")))?;
-        let name = clean_name(entry.identifier());
-        if is_special(&name) {
+    for entry in iso.read_dir(dir)? {
+        if entry.name.is_empty() {
             continue;
         }
-        let path = dst.join(&name);
-        match entry {
-            DirectoryEntry::Directory(dir) => {
-                copy_dir_to_fs(&dir, &path, total, stats, reporter)?;
+        let path = dst.join(&entry.name);
+        if entry.is_dir {
+            copy_dir_to_fs(iso, &entry, &path, total, stats, reporter)?;
+        } else {
+            let mut writer = std::fs::File::create(&path)
+                .map_err(|e| Error::Other(format!("creating {:?}: {e}", entry.name)))?;
+            iso.copy_file(&entry, &mut writer)?;
+            stats.files += 1;
+            stats.bytes += u64::from(entry.size);
+            if total > 0 {
+                reporter.progress("extract", stats.bytes as f32 / total as f32);
             }
-            DirectoryEntry::File(file) => {
-                let mut writer = std::fs::File::create(&path)
-                    .map_err(|e| Error::Other(format!("creating {name:?}: {e}")))?;
-                let mut reader = file.read();
-                std::io::copy(&mut reader, &mut writer)
-                    .map_err(|e| Error::Other(format!("copying {name:?}: {e}")))?;
-                stats.files += 1;
-                stats.bytes += u64::from(file.size());
-                if total > 0 {
-                    reporter.progress("extract", stats.bytes as f32 / total as f32);
-                }
-            }
-            _ => {}
         }
     }
     Ok(())
 }
 
 /// Recursively sum (file_count, byte_total) of a directory tree.
-fn dir_totals(dir: &ISODirectory<File>) -> (u64, u64) {
+fn dir_totals(iso: &Iso, dir: &DirEntry) -> (u64, u64) {
     let mut files = 0u64;
     let mut bytes = 0u64;
-    for entry in dir.contents().flatten() {
-        if is_special(&clean_name(entry.identifier())) {
-            continue;
-        }
-        match entry {
-            DirectoryEntry::Directory(sub) => {
-                let (f, b) = dir_totals(&sub);
+    if let Ok(entries) = iso.read_dir(dir) {
+        for entry in entries {
+            if entry.is_dir {
+                let (f, b) = dir_totals(iso, &entry);
                 files += f;
                 bytes += b;
-            }
-            DirectoryEntry::File(file) => {
+            } else {
                 files += 1;
-                bytes += u64::from(file.size());
+                bytes += u64::from(entry.size);
             }
-            _ => {}
         }
     }
     (files, bytes)
@@ -486,21 +457,6 @@ fn add_kernel_param(content: &str, param: &str) -> String {
     out
 }
 
-/// Strip the ISO9660 `;1` version suffix and any trailing dot.
-fn clean_name(raw: &str) -> String {
-    let base = raw.split(';').next().unwrap_or(raw);
-    base.trim_end_matches('.').to_string()
-}
-
-/// Skip the `.`/`..` self/parent records (identifiers 0x00 / 0x01 in ISO9660).
-fn is_special(name: &str) -> bool {
-    name.is_empty()
-        || name == "."
-        || name == ".."
-        || name.starts_with('\u{0}')
-        || name.starts_with('\u{1}')
-}
-
 /// Convenience for the CLI `inspect` path: open an ISO and return its report.
 pub fn report_for(path: impl AsRef<Path>) -> Result<IsoReport> {
     Ok(IsoReader::open(path)?.report())
@@ -528,17 +484,8 @@ mod tests {
     }
 
     #[test]
-    fn clean_name_strips_version_and_dot() {
-        assert_eq!(clean_name("README.TXT;1"), "README.TXT");
-        assert_eq!(clean_name("DIR."), "DIR");
-        assert_eq!(clean_name("file"), "file");
-    }
-
-    #[test]
     fn isohybrid_detection() {
         let p = std::env::temp_dir().join(format!("usbforge_isohybrid_{}.bin", std::process::id()));
-
-        // MBR boot signature + non-zero boot code -> isohybrid.
         let mut buf = vec![0u8; 2048];
         buf[0] = 0xEB;
         buf[1] = 0x63;
@@ -547,10 +494,8 @@ mod tests {
         std::fs::write(&p, &buf).unwrap();
         assert!(is_isohybrid(&p));
 
-        // All zero (plain ISO system area) -> not isohybrid.
         std::fs::write(&p, vec![0u8; 2048]).unwrap();
         assert!(!is_isohybrid(&p));
-
         let _ = std::fs::remove_file(&p);
     }
 
@@ -559,8 +504,8 @@ mod tests {
         let grub = "menuentry 'Live' {\n  linux /casper/vmlinuz boot=casper quiet splash ---\n  initrd /casper/initrd\n}\n";
         let out = add_kernel_param(grub, "persistent");
         assert!(out.contains("quiet splash --- persistent"));
-        assert!(out.contains("initrd /casper/initrd")); // non-kernel line untouched
-        assert_eq!(add_kernel_param(&out, "persistent"), out); // idempotent
+        assert!(out.contains("initrd /casper/initrd"));
+        assert_eq!(add_kernel_param(&out, "persistent"), out);
 
         let syslinux = "label live\n  append boot=casper quiet ---\n";
         assert!(add_kernel_param(syslinux, "persistent").contains("quiet --- persistent"));
@@ -608,24 +553,19 @@ mod tests {
     #[test]
     fn udf_detection() {
         let p = std::env::temp_dir().join(format!("usbforge_udf_{}.bin", std::process::id()));
-
-        // NSR02 in the volume recognition sequence (sector 17 here) -> UDF.
         let mut buf = vec![0u8; 20 * 2048];
-        buf[17 * 2048] = 0x00; // structure type
+        buf[17 * 2048] = 0x00;
         buf[17 * 2048 + 1..17 * 2048 + 6].copy_from_slice(b"NSR02");
         std::fs::write(&p, &buf).unwrap();
         assert!(is_udf(&p));
 
-        // Plain ISO9660 (no NSR) -> not UDF.
         std::fs::write(&p, vec![0u8; 20 * 2048]).unwrap();
         assert!(!is_udf(&p));
-
         let _ = std::fs::remove_file(&p);
     }
 
-    /// End-to-end: build a tiny ISO, read it, extract into a FAT32 volume, and
-    /// verify the files came across. Skipped when `xorrisofs` is unavailable
-    /// (e.g. on the Windows CI runner).
+    /// End-to-end: build a tiny ISO, read it with our reader, extract into a
+    /// FAT32 volume, and verify the files. Skipped when `xorrisofs` is absent.
     #[test]
     fn iso_extract_to_fat_roundtrip() {
         if !have_xorrisofs() {
@@ -651,14 +591,12 @@ mod tests {
             .unwrap();
         assert!(status.success(), "xorrisofs failed");
 
-        // Read + scan.
         let reader = IsoReader::open(&iso_path).unwrap();
         let report = reader.report();
         assert_eq!(report.volume_label, "TESTLABEL");
         assert!(report.uefi_archs.iter().any(|a| a == "x64"));
         assert_eq!(report.total_files, 3);
 
-        // Extract into a freshly FAT32-formatted in-memory device.
         let mut dev = MemDevice::new(64 * 1024 * 1024);
         let len = dev.size();
         {
@@ -669,7 +607,6 @@ mod tests {
             fs.unmount().unwrap();
         }
 
-        // Re-mount and verify the tree.
         let len = dev.size();
         let mut slice = PartitionSlice::new(&mut dev, 0, len);
         let fs = FileSystem::new(&mut slice, fat_options()).unwrap();

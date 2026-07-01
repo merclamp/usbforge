@@ -16,9 +16,5 @@ hex.workspace = true
 gpt = "4.1.0"
 fatfs = { version = "0.3.6", default-features = false, features = ["std", "alloc"] }
 ureq = "2"
-
-# ISO9660 reading. cdfs pulls `fuser` (a Unix-only FUSE crate) unconditionally,
-# so it can't build on Windows — gate it to Unix. On other targets the `iso`
-# module falls back to a stub (see iso_stub.rs / lib.rs).
-[target.'cfg(unix)'.dependencies]
-cdfs = "0.2.3"
+# ISO9660 reading is our own pure-Rust reader (src/iso9660.rs) — no external
+# crate, so the `iso` module is cross-platform (no cdfs/fuser).

@@ -173,9 +173,11 @@ with the Linux PoC, using the **exact same** `core::write` engine and CLI.
   `windows` crate. Type-checks for `x86_64-pc-windows-gnu` but has **not been run
   on real Windows** — that's the Windows side's job: build (`cargo build`),
   `list`, then `write` to a spare stick, and refine (sector alignment, error
-  messages). ISO `create` needs a cross-platform ISO reader (cdfs is Unix-only).
-- **CLI/GUI:** shared, build on both OSes; on Windows `create`/ISO-`inspect`
-  report "not supported yet" until a cross-platform ISO reader lands.
+  messages). ISO reading is our own pure-Rust reader (`iso9660.rs`), so
+  `create`/`inspect` build on Windows too.
+- **CLI/GUI:** shared, build on both OSes; ISO `create`/`inspect` now work on
+  Windows (own ISO9660 reader — no cdfs/fuser). The host-tool paths (NTFS/ext4
+  format, UDF mount, syslinux) still need native-Windows equivalents.
 
 > Cross-checking the Windows build from Linux: `rustup target add
 > x86_64-pc-windows-gnu`, install mingw-w64, then

@@ -81,7 +81,7 @@ person and benefit both OSes immediately.
 | **M2 — partition + format** | GPT/MBR table builders (`gpt`/`mbrman`), FAT32/exFAT/ext4 formatters | apply layout via `ioctl(BLKRRPART/BLKPG)`, `BLKDISCARD`, unmount before write | apply layout via `IOCTL_DISK_SET_DRIVE_LAYOUT_EX` + `IOCTL_DISK_UPDATE_PROPERTIES`, `FSCTL_DISMOUNT_VOLUME` |
 | **M3 — bootloaders + ISO** | ISO9660 extract, ms-sys boot records, syslinux/GRUB/UEFI:NTFS install over `BlockDevice` | — (mostly shared; verify on real HW) | — (mostly shared; verify on real HW) |
 | **M4 — Windows backend** | — | — | **Bulk of Windows work:** robust SetupAPI enum, full `DeviceIoControl` disk ops, volume locking |
-| **M5 — Windows-target UX** | WIM apply (`wimlib` FFI), TPM/SB bypass (`hivex`), unattend, persistence, Fido download, signature checks | — | invoke `bcdboot` for the (stubbed) To-Go path only |
+| **M5 — Windows-target UX** | WIM apply (`wimlib` FFI), TPM/SB bypass (`hivex`), unattend, persistence, signature checks | — | invoke `bcdboot` for the (stubbed) To-Go path only |
 | **M6 — GUI** | device picker, source picker, progress, dark mode, i18n (one shared Rust UI) | window/theming smoke-test on Linux | window/theming smoke-test on Windows |
 | **M7 — packaging + CI** | release metadata | deb/rpm/AppImage/Flatpak, `udev`/polkit | MSI/portable, UAC manifest, code signing |
 

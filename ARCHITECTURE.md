@@ -60,7 +60,7 @@ cross-platform (Linux + Windows) application.
 | WIM (To Go / WUE) | `wimlib/` | `core::image::wim` | FFI to upstream `wimlib` |
 | Hashing | `hash.c` | `core::hash` (done) | RustCrypto: `sha2`, `sha1`, `md-5` |
 | Windows UX / TPM bypass | `wue.c` | `core::wue` (planned) | edit offline WIM + registry hives via `hivex`/FFI |
-| ISO download (Fido) | `net.c` + Fido.ps1 | `core::net` (planned) | `reqwest`/`ureq`, reimplement Fido logic (no PowerShell) |
+| ISO download (Fido) | `net.c` + Fido.ps1 | — (out of scope) | dropped; fetch ISOs with your browser / `curl` |
 | Signature checks | `pki.c` (CryptoAPI) | `core::pki` (planned) | `rsa`/`sha2` or `openssl` crate; `osslsigncode` for Authenticode |
 | Settings | registry / `settings.h` | `core::settings` (planned) | TOML at XDG / `%APPDATA%` |
 | Locked-file detection | `process.c` (NtQuery…) | `platform` | Linux: `/proc`; Windows: RM API |
@@ -78,7 +78,6 @@ cross-platform (Linux + Windows) application.
   FFI `wimlib` (WIM).
 - **Registry hives (offline):** `hivex` (FFI) for the Win11 TPM-bypass edits.
 - **Hashing:** `sha2`, `sha1`, `md-5`, `hex` (in use).
-- **Networking:** `reqwest` or `ureq`.
 - **Crypto/signatures:** `rsa` + `sha2`, or `openssl`.
 - **CLI:** `clap` (in use). **Errors:** `thiserror` (lib), `anyhow` (bin).
 
@@ -96,8 +95,8 @@ progress + log) exists and renders on Wayland/X11.
 Achievable natively (~88% of Rufus): ISO→USB (Windows & Linux), FAT32 / NTFS /
 exFAT / UDF / ext2-4, BIOS+UEFI boot, syslinux/GRUB/UEFI:NTFS, **Win11 TPM /
 Secure Boot bypass** (offline hive edit via `hivex`), Linux persistence,
-checksums, fake-flash detection, locked-file detection, ISO download (Fido logic
-reimplemented), signature verification, VHD/VHDX images (`qemu-img`/`libvhdi`).
+checksums, fake-flash detection, locked-file detection, signature verification,
+VHD/VHDX images (`qemu-img`/`libvhdi`).
 
 **Hard blockers (depend on closed Microsoft components — out of scope / stubbed):**
 
@@ -165,12 +164,6 @@ These surface in the UI as disabled/explained options rather than silent gaps.
   mount, persistence overlay and syslinux install use host tools (ntfs-3g,
   e2fsprogs, kernel udf, syslinux) on Linux — the Windows backend will use native
   APIs._
-- **ISO download (done):** `core::net` streams a URL to a file with progress and
-  on-the-fly SHA-256 verification (pure-Rust HTTP+TLS via `ureq`/rustls — works
-  on Windows too), plus a distro resolver (`resolve_alpine` reads Alpine's
-  release index). CLI `download <url|distro> [dest] [--sha256]`; verified over
-  the network (Alpine ISO, hash confirmed). _TODO: more distro resolvers;
-  Windows-ISO download (Fido/MS API) is a separate, brittle effort._
 - **M4 — Windows backend (experimental):** `platform/src/windows` implements the
   same traits with the `windows` crate — enumeration by probing
   `\\.\PhysicalDriveN` + `IOCTL_STORAGE_QUERY_PROPERTY`/`IOCTL_DISK_GET_LENGTH_INFO`,
@@ -178,22 +171,20 @@ These surface in the UI as disabled/explained options rather than silent gaps.
   `SetFilePointerEx`/`FlushFileBuffers`, locking+dismounting the disk's volumes
   first for an exclusive write. The `iso` module now uses our own pure-Rust
   ISO9660+Joliet reader (`iso9660.rs`, no `cdfs`/`fuser`), so `list`/`inspect`/
-  `write`/`format`/`create` (FAT32 ISO file-copy) and `download` all build on
+  `write`/`format`/`create` (FAT32 ISO file-copy) all build on
   Windows. **Type-checked against `x86_64-pc-windows-gnu`; not yet run on real
   Windows** — hence experimental. _TODO: runtime testing; UAC elevation for the
   GUI; sector-aligned I/O; the host-tool paths (NTFS/ext4 format, UDF mount,
   syslinux) still need native-Windows equivalents._
 - **M5 — Windows UX:** WIM apply, TPM/Secure-Boot bypass via `hivex`, unattend,
-  persistence; Fido download; signature checks.
+  persistence; signature checks.
 - **M6 — GUI (done):** Slint window — device dropdown + refresh, image picker
   (`rfd`), create/write/format modes with a FAT32/NTFS/auto selector,
   scheme/label fields, erase confirmation, progress bar + log. Enumeration runs
   in-process; the destructive op is delegated to the `usbforge` CLI via
   **pkexec** (native PolicyKit prompt; the GUI never runs as root), and the CLI's
-  stderr is parsed back into the progress bar + log. An ISO downloader section
-  runs `usbforge download` directly (no elevation) and feeds the fetched file
-  into the image field. Verified rendering on Wayland with a real device, the
-  NTFS selector and the download section. _TODO: dark mode polish, i18n,
-  cancel button, Windows UAC elevation path._
+  stdout/stderr are streamed back into the progress bar + log, live and in order.
+  Verified rendering on Wayland with a real device and the NTFS selector. _TODO:
+  dark mode polish, i18n, cancel button, Windows UAC elevation path._
 - **M7 — Packaging:** deb/rpm/AppImage/Flatpak (Linux), MSI/portable (Windows);
   CI matrix.

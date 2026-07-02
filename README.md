@@ -55,11 +55,6 @@ cargo run -p usbforge-cli -- list --all     # include fixed disks
 cargo run -p usbforge-cli -- hash path/to/image.iso
 cargo run -p usbforge-cli -- inspect path/to/disk.iso   # ISOs: label, files, UEFI/BIOS bootability
 
-# Download an ISO (streamed, with progress + SHA-256 verification). Takes a full
-# URL, or a distro shortcut that resolves the latest release:
-cargo run -p usbforge-cli -- download alpine:virt
-cargo run -p usbforge-cli -- download https://example.com/x.iso out.iso --sha256 <hex>
-
 # The destructive operations need root, prompt for confirmation unless --yes,
 # and refuse fixed/system disks unless --allow-fixed.
 

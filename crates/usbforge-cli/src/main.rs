@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Read as _, Seek as _, SeekFrom, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -54,17 +54,6 @@ enum Command {
         /// Algorithms: any of md5, sha1, sha256, sha512 (default: all).
         #[arg(long, value_delimiter = ',')]
         algo: Vec<String>,
-    },
-    /// Download an ISO by URL (with progress + optional SHA-256 verification),
-    /// or a distro shortcut like `alpine` / `alpine:standard`.
-    Download {
-        /// An https:// URL, or a distro shortcut (`alpine[:flavor]`).
-        source: String,
-        /// Output file (default: the URL's filename in the current directory).
-        dest: Option<String>,
-        /// Expected SHA-256 (hex) to verify the download against.
-        #[arg(long)]
-        sha256: Option<String>,
     },
     /// Write a raw image (.iso/.img/.raw) to a device. DESTROYS all data on it.
     Write {
@@ -175,11 +164,6 @@ fn main() -> Result<()> {
         Command::List { all } => cmd_list(all),
         Command::Inspect { path } => cmd_inspect(&path),
         Command::Hash { path, algo } => cmd_hash(&path, &algo),
-        Command::Download {
-            source,
-            dest,
-            sha256,
-        } => cmd_download(&source, dest, sha256),
         Command::Write {
             image,
             device,
@@ -1105,46 +1089,6 @@ fn run_tool(cmd: &str, args: &[&str]) -> Result<()> {
     if !status.success() {
         bail!("`{cmd}` failed (exit {:?})", status.code());
     }
-    Ok(())
-}
-
-fn cmd_download(source: &str, dest: Option<String>, sha256: Option<String>) -> Result<()> {
-    let (url, resolved_sha) = if source.starts_with("http://") || source.starts_with("https://") {
-        (source.to_string(), None)
-    } else {
-        // distro shortcut: `alpine` or `alpine:standard`
-        let (distro, flavor) = source.split_once(':').unwrap_or((source, "virt"));
-        match distro {
-            "alpine" => usbforge_core::net::resolve_alpine(flavor)?,
-            other => bail!("unknown distro shortcut '{other}'; pass a full https:// URL instead"),
-        }
-    };
-
-    let dest = dest.map(PathBuf::from).unwrap_or_else(|| {
-        let name = url
-            .rsplit('/')
-            .find(|s| !s.is_empty())
-            .unwrap_or("download.iso");
-        PathBuf::from(name)
-    });
-
-    eprintln!("Source: {url}");
-    eprintln!("Saving to: {}", dest.display());
-    let expected = sha256.or(resolved_sha);
-
-    let reporter = CliReporter::new();
-    let bytes = usbforge_core::net::download_to_file(&url, &dest, expected.as_deref(), &reporter)?;
-    eprintln!();
-    println!(
-        "Downloaded {} to {}{}.",
-        humanize_bytes(bytes),
-        dest.display(),
-        if expected.is_some() {
-            " (SHA-256 verified)"
-        } else {
-            ""
-        }
-    );
     Ok(())
 }
 

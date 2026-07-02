@@ -26,7 +26,6 @@ pub mod image;
 pub mod iso;
 mod iso9660;
 pub mod layout;
-pub mod net;
 pub mod report;
 pub mod uefi_ntfs;
 pub mod write;

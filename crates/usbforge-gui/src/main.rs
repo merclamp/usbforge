@@ -143,7 +143,6 @@ fn refresh_devices(app: &AppWindow, store: &Rc<RefCell<Vec<Device>>>) {
     *store.borrow_mut() = list;
 }
 
-/// Build the `usbforge` CLI argument vector for the selected operation.
 /// The "working" status shown once the operation is actually running, phrased
 /// for the selected mode (kept in sync with the modes in [`build_cli_args`]:
 /// 0 = create, 1 = write, 2 = format).
@@ -155,6 +154,7 @@ fn working_status(mode: i32, device_path: &str) -> String {
     }
 }
 
+/// Build the `usbforge` CLI argument vector for the selected operation.
 fn build_cli_args(
     mode: i32,
     scheme_index: i32,
@@ -206,12 +206,7 @@ fn build_cli_args(
 
 /// Launch the CLI and stream its output to the UI. When `elevate` is set the
 /// command runs via pkexec (needed for device operations).
-fn run_cli(
-    args: Vec<String>,
-    weak: slint::Weak<AppWindow>,
-    elevate: bool,
-    working_status: String,
-) {
+fn run_cli(args: Vec<String>, weak: slint::Weak<AppWindow>, elevate: bool, working_status: String) {
     let cli = cli_path();
     let (program, full_args) = if elevate && tool_exists("pkexec") {
         let mut a = vec![cli.to_string_lossy().to_string()];

@@ -5,11 +5,18 @@ writing disk images — a clean-room **Rust** reimagining of
 [Rufus](https://github.com/pbatard/rufus), carrying over its feature set onto a
 portable, memory-safe codebase.
 
-> Status: **early, but it writes.** The workspace builds; the CLI enumerates
-> removable devices, verifies checksums, and writes raw images (`.iso`/`.img`/
-> `.raw`) to a device dd-style with progress, flush, and read-back verification —
-> guarded so it refuses fixed/system disks. Formatting, bootloaders, the Windows
-> backend, and the GUI are next — see [`ARCHITECTURE.md`](ARCHITECTURE.md).
+> Status: **it makes bootable drives (Linux).** The CLI and a Slint GUI
+> enumerate removable devices, verify checksums, and write raw images
+> (`.iso`/`.img`/`.raw`) dd-style with progress, flush, and read-back
+> verification. Beyond raw write they partition/format (GPT/MBR, FAT32) and
+> **create** bootable media from an ISO: UEFI file-copy onto a FAT32 ESP,
+> UEFI:NTFS for Windows ISOs > 4 GiB, a persistent ext4 overlay for live Linux,
+> and BIOS boot via syslinux. ISO9660 + Joliet reading is our own pure-Rust,
+> cross-platform reader (no C dependency). Destructive operations are guarded —
+> they refuse fixed/system disks unless forced. The **Windows backend**
+> implements the same traits but is **experimental**: it compiles for
+> `x86_64-pc-windows-gnu` and has not yet run on real Windows. See
+> [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Why a rewrite (not a port)
 
@@ -84,8 +91,9 @@ cargo test
 ### GUI
 
 A Slint desktop GUI wraps the same engine — device dropdown, image picker,
-write/format/create modes (with a FAT32/NTFS/auto selector), an ISO downloader,
-progress bar + log:
+write/format/create modes (with a FAT32/NTFS/auto selector), and a progress bar
++ log that stream straight from the CLI as it works (the bar advances smoothly
+even while a single multi-GiB file is being copied):
 
 ```sh
 cargo run -p usbforge-gui          # run as a normal user

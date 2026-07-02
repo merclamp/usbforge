@@ -3,8 +3,8 @@
 //! Device enumeration runs in-process (no privileges needed). The destructive
 //! operations are delegated to the `usbforge` CLI, launched via **pkexec** so
 //! PolicyKit shows a native auth dialog and the work runs as root — the GUI
-//! itself never needs to be root. The CLI's progress/log (on stderr) is streamed
-//! back into the window.
+//! itself never needs to be root. The CLI's progress/log (stdout + stderr) is
+//! streamed back into the window, line by line, as it runs.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use std::cell::RefCell;
@@ -12,6 +12,8 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use slint::{ModelRc, SharedString, VecModel};
 
@@ -103,57 +105,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             app.set_progress(0.0);
             app.set_progress_text("0%".into());
             app.set_log(SharedString::from(""));
-            app.set_status(format!("Authorising and working on {} …", device.path).into());
+            app.set_status(format!("Authorising access to {} …", device.path).into());
 
+            let working = working_status(mode, &device.path);
             let weak = weak.clone();
-            std::thread::spawn(move || run_cli(args, weak, true, None));
-        });
-    }
-
-    // Download: pick a save location (native save dialog).
-    {
-        let weak = app.as_weak();
-        app.on_download_browse(move || {
-            if let Some(file) = rfd::FileDialog::new()
-                .set_file_name("download.iso")
-                .save_file()
-            {
-                if let Some(app) = weak.upgrade() {
-                    app.set_download_dest(file.display().to_string().into());
-                }
-            }
-        });
-    }
-
-    // Download an ISO by URL / distro shortcut (no elevation needed).
-    {
-        let weak = app.as_weak();
-        app.on_download(move || {
-            let app = match weak.upgrade() {
-                Some(a) => a,
-                None => return,
-            };
-            let source = app.get_download_source().to_string();
-            if source.trim().is_empty() {
-                app.set_status("Enter a URL or a distro shortcut (e.g. alpine:virt).".into());
-                return;
-            }
-            let dest = app.get_download_dest().to_string();
-            if dest.trim().is_empty() {
-                app.set_status("Choose where to save the download first.".into());
-                return;
-            }
-
-            let args = vec!["download".to_string(), source, dest.clone()];
-
-            app.set_busy(true);
-            app.set_progress(0.0);
-            app.set_progress_text("0%".into());
-            app.set_log(SharedString::from(""));
-            app.set_status("Downloading …".into());
-
-            let weak = weak.clone();
-            std::thread::spawn(move || run_cli(args, weak, false, Some(dest)));
+            std::thread::spawn(move || run_cli(args, weak, true, working));
         });
     }
 
@@ -188,6 +144,17 @@ fn refresh_devices(app: &AppWindow, store: &Rc<RefCell<Vec<Device>>>) {
 }
 
 /// Build the `usbforge` CLI argument vector for the selected operation.
+/// The "working" status shown once the operation is actually running, phrased
+/// for the selected mode (kept in sync with the modes in [`build_cli_args`]:
+/// 0 = create, 1 = write, 2 = format).
+fn working_status(mode: i32, device_path: &str) -> String {
+    match mode {
+        0 => format!("Creating bootable drive on {device_path} …"),
+        1 => format!("Writing image to {device_path} …"),
+        _ => format!("Formatting {device_path} …"),
+    }
+}
+
 fn build_cli_args(
     mode: i32,
     scheme_index: i32,
@@ -238,14 +205,12 @@ fn build_cli_args(
 }
 
 /// Launch the CLI and stream its output to the UI. When `elevate` is set the
-/// command runs via pkexec (needed for device operations). On success, if
-/// `set_image_on_success` is given, that path is written into the image field
-/// (used after a download so it feeds create/write).
+/// command runs via pkexec (needed for device operations).
 fn run_cli(
     args: Vec<String>,
     weak: slint::Weak<AppWindow>,
     elevate: bool,
-    set_image_on_success: Option<String>,
+    working_status: String,
 ) {
     let cli = cli_path();
     let (program, full_args) = if elevate && tool_exists("pkexec") {
@@ -269,60 +234,87 @@ fn run_cli(
         }
     };
 
-    if let Some(stderr) = child.stderr.take() {
-        stream_output(stderr, &weak);
-    }
+    // Stream stdout and stderr concurrently, line by line, so everything the CLI
+    // prints shows up live and in order — not dumped as one blob at the end.
+    // (Draining stderr fully *before* touching stdout also risked a pipe-buffer
+    // deadlock, and could drop the CLI's unterminated final `\r…100%` line.)
+    let stderr = child.stderr.take();
+    let stdout = child.stdout.take();
 
-    let mut stdout = String::new();
-    if let Some(mut so) = child.stdout.take() {
-        let _ = so.read_to_string(&mut stdout);
+    // Flip the status from "Authorising …" to the working label the moment the
+    // first output arrives (i.e. pkexec auth passed and the CLI is running), so
+    // the window stops saying "Authorising" while it's actually working.
+    let started = Arc::new(AtomicBool::new(false));
+    let working = Arc::new(working_status);
+
+    let err_join = {
+        let weak = weak.clone();
+        let started = started.clone();
+        let working = working.clone();
+        std::thread::spawn(move || {
+            if let Some(e) = stderr {
+                pump(e, &weak, &started, &working);
+            }
+        })
+    };
+
+    // stdout on this thread; keep its last non-empty line for the status message.
+    let mut last_stdout = String::new();
+    if let Some(o) = stdout {
+        last_stdout = pump(o, &weak, &started, &working);
     }
-    if !stdout.trim().is_empty() {
-        append_log(&weak, stdout.trim());
-    }
+    let _ = err_join.join();
 
     let ok = child.wait().map(|s| s.success()).unwrap_or(false);
     let msg = if ok {
-        stdout
-            .lines()
-            .last()
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "Done.".to_string())
+        if last_stdout.is_empty() {
+            "Done.".to_string()
+        } else {
+            last_stdout
+        }
     } else {
         "Operation failed or was cancelled — see the log.".to_string()
     };
 
-    if ok {
-        if let Some(path) = set_image_on_success {
-            let w = weak.clone();
-            let _ = slint::invoke_from_event_loop(move || {
-                if let Some(app) = w.upgrade() {
-                    app.set_image_path(path.into());
-                }
-            });
-        }
-    }
     finish(&weak, ok, msg);
 }
 
-/// Read the child's stderr, splitting on `\n`/`\r`, and route lines to either the
-/// progress bar (`op: NN%`) or the log.
-fn stream_output(stderr: std::process::ChildStderr, weak: &slint::Weak<AppWindow>) {
-    let mut reader = std::io::BufReader::new(stderr);
+/// Read a child stream byte-by-byte, splitting on `\n`/`\r`, and route each line
+/// to the progress bar (`op: NN%`) or the log. Flushes a trailing unterminated
+/// line at EOF — the CLI's final `\r…100%` progress carries no newline — so the
+/// last line is never dropped. Returns the last non-empty line seen (the caller
+/// uses stdout's for the finish message).
+fn pump(
+    stream: impl Read,
+    weak: &slint::Weak<AppWindow>,
+    started: &AtomicBool,
+    working_status: &str,
+) -> String {
+    let mut reader = std::io::BufReader::new(stream);
     let mut buf: Vec<u8> = Vec::with_capacity(128);
     let mut byte = [0u8; 1];
+    let mut last = String::new();
+    let flush = |buf: &mut Vec<u8>, last: &mut String| {
+        if buf.is_empty() {
+            return;
+        }
+        let line = String::from_utf8_lossy(buf).trim().to_string();
+        buf.clear();
+        if !line.is_empty() {
+            // First real output means auth passed and work has begun.
+            if !started.swap(true, Ordering::Relaxed) {
+                set_status(weak, working_status);
+            }
+            *last = line.clone();
+            handle_line(&line, weak);
+        }
+    };
     loop {
         match reader.read(&mut byte) {
             Ok(0) => break,
             Ok(_) => {
                 if byte[0] == b'\n' || byte[0] == b'\r' {
-                    if !buf.is_empty() {
-                        let line = String::from_utf8_lossy(&buf).trim().to_string();
-                        if !line.is_empty() {
-                            handle_line(&line, weak);
-                        }
-                        buf.clear();
-                    }
+                    flush(&mut buf, &mut last);
                 } else {
                     buf.push(byte[0]);
                 }
@@ -330,6 +322,8 @@ fn stream_output(stderr: std::process::ChildStderr, weak: &slint::Weak<AppWindow
             Err(_) => break,
         }
     }
+    flush(&mut buf, &mut last); // trailing line with no terminator
+    last
 }
 
 /// A line of CLI output → progress update or log line.
@@ -351,6 +345,16 @@ fn handle_line(line: &str, weak: &slint::Weak<AppWindow>) {
         }
     }
     append_log(weak, line);
+}
+
+fn set_status(weak: &slint::Weak<AppWindow>, status: &str) {
+    let status = status.to_string();
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(app) = weak.upgrade() {
+            app.set_status(status.into());
+        }
+    });
 }
 
 fn append_log(weak: &slint::Weak<AppWindow>, line: &str) {

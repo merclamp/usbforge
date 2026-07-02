@@ -1,5 +1,5 @@
 import {
-    Button, ComboBox, LineEdit, CheckBox, GroupBox, TextEdit, VerticalBox, HorizontalBox
+    Button, ComboBox, LineEdit, CheckBox, GroupBox, TextEdit, VerticalBox, HorizontalBox, ScrollView
 } from "std-widgets.slint";
 
 export component AppWindow inherits Window {
@@ -7,14 +7,13 @@ export component AppWindow inherits Window {
     preferred-width: 580px;
     preferred-height: 640px;
     min-width: 480px;
-    min-height: 520px;
+    min-height: 400px;
 
     // --- inputs from Rust ---
     in property <[string]> devices;
     in property <float> progress;            // 0.0 .. 1.0
     in property <string> progress-text: "0%";
     in property <string> status: "Ready.";
-    in property <string> log;
     in property <bool> busy: false;
 
     // --- two-way state (edited in the UI) ---
@@ -31,134 +30,131 @@ export component AppWindow inherits Window {
     callback browse();
     callback start();
 
-    VerticalBox {
-        padding: 16px;
-        spacing: 10px;
+    // Everything scrolls, so no control is ever clipped when the window is short
+    // (small screens, or the create-mode extra "Filesystem" row). `visible-width`
+    // pins the content to the viewport width — vertical scrolling only.
+    ScrollView {
+        viewport-width: self.visible-width;
 
-        Text { text: "USBForge"; font-size: 22px; font-weight: 800; }
-        Text {
-            text: "Cross-platform bootable USB / disk image writer";
-            color: gray;
-        }
+        VerticalBox {
+            padding: 14px;
+            spacing: 8px;
 
-        GroupBox {
-            title: "Target device (removable only)";
-            HorizontalBox {
-                spacing: 8px;
-                ComboBox {
-                    model: devices;
-                    current-index <=> device-index;
-                    enabled: !busy;
-                    horizontal-stretch: 1;
-                }
-                Button { text: "Refresh"; enabled: !busy; clicked => { refresh(); } }
-            }
-        }
-
-        GroupBox {
-            title: "Operation";
-            VerticalBox {
-                spacing: 8px;
-                ComboBox {
-                    model: [
-                        "Create bootable USB from ISO (file-copy, UEFI)",
-                        "Write image raw (dd; isohybrid ISO = BIOS+UEFI)",
-                        "Format only (FAT32)"
-                    ];
-                    current-index <=> mode-index;
-                    enabled: !busy;
-                }
-                HorizontalBox {
-                    spacing: 8px;
-                    LineEdit {
-                        placeholder-text: "Path to .iso / .img / .raw …";
-                        text <=> image-path;
-                        enabled: !busy && mode-index != 2;
-                        horizontal-stretch: 1;
-                    }
-                    Button {
-                        text: "Browse…";
-                        enabled: !busy && mode-index != 2;
-                        clicked => { browse(); }
-                    }
-                }
-                HorizontalBox {
-                    spacing: 8px;
-                    Text { text: "Label:"; vertical-alignment: center; }
-                    LineEdit {
-                        text <=> volume-label;
-                        enabled: !busy;
-                        horizontal-stretch: 1;
-                    }
-                    Text { text: "Scheme:"; vertical-alignment: center; }
-                    ComboBox {
-                        model: ["GPT", "MBR"];
-                        current-index <=> scheme-index;
-                        enabled: !busy;
-                    }
-                }
-                if (mode-index == 0) : HorizontalBox {
-                    spacing: 8px;
-                    Text { text: "Filesystem:"; vertical-alignment: center; }
-                    ComboBox {
-                        model: ["Auto (NTFS for Windows ISO, else FAT32)", "FAT32", "NTFS (UEFI:NTFS)"];
-                        current-index <=> create-fs-index;
-                        enabled: !busy;
-                        horizontal-stretch: 1;
-                    }
-                }
-            }
-        }
-
-        CheckBox {
-            text: "I understand ALL DATA on the selected device will be erased";
-            checked <=> confirm-erase;
-            enabled: !busy;
-        }
-
-        Button {
-            text: busy ? "Working…" : "START";
-            enabled: !busy && confirm-erase;
-            clicked => { start(); }
-        }
-
-        // progress bar
-        Rectangle {
-            height: 20px;
-            border-radius: 5px;
-            background: #d0d0d0;
-            Rectangle {
-                x: 0;
-                y: 0;
-                height: parent.height;
-                width: parent.width * max(0.0, min(1.0, progress));
-                border-radius: 5px;
-                background: #3a7afe;
-            }
+            Text { text: "USBForge"; font-size: 22px; font-weight: 800; }
             Text {
-                text: progress-text;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-                color: black;
+                text: "Cross-platform bootable USB / disk image writer";
+                color: gray;
             }
-        }
 
-        Text { text: status; }
-
-        GroupBox {
-            title: "Log";
-            vertical-stretch: 1;
-            TextEdit {
-                text: log;
-                read-only: true;
-                wrap: word-wrap;
+            GroupBox {
+                title: "Target device (removable only)";
+                HorizontalBox {
+                    spacing: 8px;
+                    ComboBox {
+                        model: devices;
+                        current-index <=> device-index;
+                        enabled: !busy;
+                        horizontal-stretch: 1;
+                    }
+                    Button { text: "Refresh"; enabled: !busy; clicked => { refresh(); } }
+                }
             }
-        }
 
-        Text {
-            text: "Tip: run with sudo / pkexec to get write access to devices.";
-            color: gray;
-            font-size: 11px;
+            GroupBox {
+                title: "Operation";
+                VerticalBox {
+                    spacing: 8px;
+                    ComboBox {
+                        model: [
+                            "Create bootable USB from ISO (file-copy, UEFI)",
+                            "Write image raw (dd; isohybrid ISO = BIOS+UEFI)",
+                            "Format only (FAT32)"
+                        ];
+                        current-index <=> mode-index;
+                        enabled: !busy;
+                    }
+                    HorizontalBox {
+                        spacing: 8px;
+                        LineEdit {
+                            placeholder-text: "Path to .iso / .img / .raw …";
+                            text <=> image-path;
+                            enabled: !busy && mode-index != 2;
+                            horizontal-stretch: 1;
+                        }
+                        Button {
+                            text: "Browse…";
+                            enabled: !busy && mode-index != 2;
+                            clicked => { browse(); }
+                        }
+                    }
+                    HorizontalBox {
+                        spacing: 8px;
+                        Text { text: "Label:"; vertical-alignment: center; }
+                        LineEdit {
+                            text <=> volume-label;
+                            enabled: !busy;
+                            horizontal-stretch: 1;
+                        }
+                        Text { text: "Scheme:"; vertical-alignment: center; }
+                        ComboBox {
+                            model: ["GPT", "MBR"];
+                            current-index <=> scheme-index;
+                            enabled: !busy;
+                        }
+                    }
+                    if (mode-index == 0) : HorizontalBox {
+                        spacing: 8px;
+                        Text { text: "Filesystem:"; vertical-alignment: center; }
+                        ComboBox {
+                            model: ["Auto (NTFS for Windows ISO, else FAT32)", "FAT32", "NTFS (UEFI:NTFS)"];
+                            current-index <=> create-fs-index;
+                            enabled: !busy;
+                            horizontal-stretch: 1;
+                        }
+                    }
+                }
+            }
+
+            CheckBox {
+                text: "I understand ALL DATA on the selected device will be erased";
+                checked <=> confirm-erase;
+                enabled: !busy;
+            }
+
+            Button {
+                text: busy ? "Working…" : "START";
+                enabled: !busy && confirm-erase;
+                clicked => { start(); }
+            }
+
+            // progress bar
+            Rectangle {
+                height: 20px;
+                border-radius: 5px;
+                background: #d0d0d0;
+                Rectangle {
+                    x: 0;
+                    y: 0;
+                    height: parent.height;
+                    width: parent.width * max(0.0, min(1.0, progress));
+                    border-radius: 5px;
+                    background: #3a7afe;
+                }
+                Text {
+                    text: progress-text;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    color: black;
+                }
+            }
+
+            Text { text: status; }
+
+            Text {
+                text: "Tip: run with sudo / pkexec to get write access to devices.";
+                color: gray;
+                font-size: 11px;
+            }
         }
     }
 }

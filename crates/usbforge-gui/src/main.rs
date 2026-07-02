@@ -3,8 +3,8 @@
 //! Device enumeration runs in-process (no privileges needed). The destructive
 //! operations are delegated to the `usbforge` CLI, launched via **pkexec** so
 //! PolicyKit shows a native auth dialog and the work runs as root — the GUI
-//! itself never needs to be root. The CLI's progress/log (stdout + stderr) is
-//! streamed back into the window, line by line, as it runs.
+//! itself never needs to be root. The CLI's stdout + stderr are parsed as it
+//! runs to drive the progress bar; the window shows a phase status + that bar.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use std::cell::RefCell;
@@ -104,7 +104,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             app.set_busy(true);
             app.set_progress(0.0);
             app.set_progress_text("0%".into());
-            app.set_log(SharedString::from(""));
             app.set_status(format!("Authorising access to {} …", device.path).into());
 
             let working = working_status(mode, &device.path);
@@ -268,17 +267,17 @@ fn run_cli(args: Vec<String>, weak: slint::Weak<AppWindow>, elevate: bool, worki
             last_stdout
         }
     } else {
-        "Operation failed or was cancelled — see the log.".to_string()
+        "Operation failed or was cancelled.".to_string()
     };
 
     finish(&weak, ok, msg);
 }
 
-/// Read a child stream byte-by-byte, splitting on `\n`/`\r`, and route each line
-/// to the progress bar (`op: NN%`) or the log. Flushes a trailing unterminated
-/// line at EOF — the CLI's final `\r…100%` progress carries no newline — so the
-/// last line is never dropped. Returns the last non-empty line seen (the caller
-/// uses stdout's for the finish message).
+/// Read a child stream byte-by-byte, splitting on `\n`/`\r`, and feed each line
+/// to the progress parser. Flushes a trailing unterminated line at EOF — the
+/// CLI's final `\r…100%` progress carries no newline — so the last line is never
+/// dropped. Returns the last non-empty line seen (the caller uses stdout's for
+/// the finish message).
 fn pump(
     stream: impl Read,
     weak: &slint::Weak<AppWindow>,
@@ -321,7 +320,8 @@ fn pump(
     last
 }
 
-/// A line of CLI output → progress update or log line.
+/// A `op: NN%` line advances the progress bar; any other line is ignored (the
+/// window shows the phase status + bar, not a full log).
 fn handle_line(line: &str, weak: &slint::Weak<AppWindow>) {
     if let Some(prefix) = line.strip_suffix('%') {
         if let Some(num) = prefix.rsplit([' ', ':']).next() {
@@ -335,11 +335,9 @@ fn handle_line(line: &str, weak: &slint::Weak<AppWindow>) {
                         app.set_progress_text(text.into());
                     }
                 });
-                return;
             }
         }
     }
-    append_log(weak, line);
 }
 
 fn set_status(weak: &slint::Weak<AppWindow>, status: &str) {
@@ -348,18 +346,6 @@ fn set_status(weak: &slint::Weak<AppWindow>, status: &str) {
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(app) = weak.upgrade() {
             app.set_status(status.into());
-        }
-    });
-}
-
-fn append_log(weak: &slint::Weak<AppWindow>, line: &str) {
-    let line = format!("{line}\n");
-    let weak = weak.clone();
-    let _ = slint::invoke_from_event_loop(move || {
-        if let Some(app) = weak.upgrade() {
-            let mut s = app.get_log().to_string();
-            s.push_str(&line);
-            app.set_log(s.into());
         }
     });
 }

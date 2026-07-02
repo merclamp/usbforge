@@ -311,13 +311,41 @@ fn copy_dir<W: ReadWriteSeek>(
             let mut writer = dst
                 .create_file(&entry.name)
                 .map_err(|e| Error::Other(format!("creating file {:?}: {e}", entry.name)))?;
-            iso.copy_file(&entry, &mut writer)?;
-            stats.files += 1;
-            stats.bytes += u64::from(entry.size);
-            if total > 0 {
-                reporter.progress("extract", stats.bytes as f32 / total as f32);
-            }
+            copy_one_file(iso, &entry, &mut writer, total, stats, reporter)?;
         }
+    }
+    Ok(())
+}
+
+/// Copy a single file, reporting progress *within* it (throttled to whole-%
+/// changes of the overall total) so the counter keeps moving during large
+/// files instead of freezing until the whole file is done. `stats` is advanced
+/// to include this file on return.
+fn copy_one_file<W: Write>(
+    iso: &Iso,
+    entry: &DirEntry,
+    writer: &mut W,
+    total: u64,
+    stats: &mut ExtractStats,
+    reporter: &dyn Reporter,
+) -> Result<()> {
+    let base = stats.bytes;
+    // Whole-% of the overall total: enough to keep the counter moving through a
+    // multi-GiB file, without a tick per 256 KiB chunk. `checked_div` yields
+    // `None` when `total` is 0, so progress is simply never reported then.
+    let pct = |done: u64| (done * 100).checked_div(total);
+    let mut last = pct(base);
+    iso.copy_file_with(entry, writer, |written| {
+        let now = pct(base + written);
+        if now != last {
+            last = now;
+            reporter.progress("extract", (base + written) as f32 / total as f32);
+        }
+    })?;
+    stats.files += 1;
+    stats.bytes += u64::from(entry.size);
+    if total > 0 {
+        reporter.progress("extract", stats.bytes as f32 / total as f32);
     }
     Ok(())
 }
@@ -342,12 +370,7 @@ fn copy_dir_to_fs(
         } else {
             let mut writer = std::fs::File::create(&path)
                 .map_err(|e| Error::Other(format!("creating {:?}: {e}", entry.name)))?;
-            iso.copy_file(&entry, &mut writer)?;
-            stats.files += 1;
-            stats.bytes += u64::from(entry.size);
-            if total > 0 {
-                reporter.progress("extract", stats.bytes as f32 / total as f32);
-            }
+            copy_one_file(iso, &entry, &mut writer, total, stats, reporter)?;
         }
     }
     Ok(())
@@ -469,9 +492,24 @@ fn fat_options() -> FsOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::report::NullReporter;
+    use crate::report::{Level, NullReporter};
     use crate::testutil::MemDevice;
     use std::process::Command;
+    use std::sync::Mutex;
+
+    /// A reporter that records every `progress("extract", …)` fraction, so tests
+    /// can assert the counter advances *during* a file, not only after it.
+    struct RecordingReporter {
+        fractions: Mutex<Vec<f32>>,
+    }
+    impl Reporter for RecordingReporter {
+        fn log(&self, _level: Level, _message: &str) {}
+        fn progress(&self, operation: &str, fraction: f32) {
+            if operation == "extract" {
+                self.fractions.lock().unwrap().push(fraction);
+            }
+        }
+    }
 
     fn have_xorrisofs() -> bool {
         Command::new("xorrisofs")
@@ -627,6 +665,67 @@ mod tests {
         assert_eq!(s2, "nested");
 
         assert!(root.open_file("EFI/BOOT/BOOTX64.EFI").is_ok());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A single file larger than one copy chunk must report progress *while*
+    /// it streams (intermediate fractions), not just once at completion — the
+    /// fix for the "frozen counter on a big squashfs" symptom.
+    #[test]
+    fn progress_advances_within_a_large_file() {
+        if !have_xorrisofs() {
+            eprintln!("skipping progress_advances_within_a_large_file: xorrisofs not found");
+            return;
+        }
+
+        let base = std::env::temp_dir().join(format!("usbforge_iso_prog_{}", std::process::id()));
+        let src = base.join("src");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&src).unwrap();
+        // One 2 MiB file → 8 chunks of 256 KiB, dominating the total so each
+        // chunk crosses a whole-% boundary.
+        std::fs::write(src.join("BIG.BIN"), vec![0xABu8; 2 * 1024 * 1024]).unwrap();
+
+        let iso_path = base.join("big.iso");
+        let status = Command::new("xorrisofs")
+            .args(["-quiet", "-J", "-R", "-V", "BIG", "-o"])
+            .arg(&iso_path)
+            .arg(&src)
+            .status()
+            .unwrap();
+        assert!(status.success(), "xorrisofs failed");
+
+        let reader = IsoReader::open(&iso_path).unwrap();
+        let rep = RecordingReporter {
+            fractions: Mutex::new(Vec::new()),
+        };
+
+        let mut dev = MemDevice::new(64 * 1024 * 1024);
+        let len = dev.size();
+        let mut slice = PartitionSlice::new(&mut dev, 0, len);
+        format_fat32(&mut slice, "BIG").unwrap();
+        let fs = FileSystem::new(&mut slice, fat_options()).unwrap();
+        reader.extract_to_fat(&fs, &rep).unwrap();
+        fs.unmount().unwrap();
+
+        let fractions = rep.fractions.into_inner().unwrap();
+        // Reported more than the single end-of-file tick the old code gave.
+        assert!(
+            fractions.len() >= 4,
+            "expected several progress ticks, got {fractions:?}"
+        );
+        // At least one tick lands strictly inside the copy (mid-file).
+        assert!(
+            fractions.iter().any(|&f| f > 0.0 && f < 0.95),
+            "no mid-file progress tick: {fractions:?}"
+        );
+        // Monotonic non-decreasing and finishes at 100%.
+        assert!(
+            fractions.windows(2).all(|w| w[1] >= w[0]),
+            "not monotonic: {fractions:?}"
+        );
+        assert_eq!(fractions.last().copied(), Some(1.0));
 
         let _ = std::fs::remove_dir_all(&base);
     }

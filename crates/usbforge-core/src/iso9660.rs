@@ -147,8 +147,16 @@ impl Iso {
         Ok(entries)
     }
 
-    /// Stream a file's contents into `out`. Returns bytes written.
-    pub fn copy_file<W: Write>(&self, entry: &DirEntry, out: &mut W) -> Result<u64> {
+    /// Stream a file's contents into `out`, invoking `on_progress` after each
+    /// chunk with the running byte count. Lets callers report smooth progress
+    /// while a single large file (e.g. a multi-GiB squashfs) streams out.
+    /// Returns bytes written.
+    pub fn copy_file_with<W: Write>(
+        &self,
+        entry: &DirEntry,
+        out: &mut W,
+        mut on_progress: impl FnMut(u64),
+    ) -> Result<u64> {
         let mut f = self.file.borrow_mut();
         f.seek(SeekFrom::Start(entry.extent as u64 * SECTOR))?;
         let mut remaining = u64::from(entry.size);
@@ -160,6 +168,7 @@ impl Iso {
             out.write_all(&buf[..want])?;
             remaining -= want as u64;
             total += want as u64;
+            on_progress(total);
         }
         Ok(total)
     }
